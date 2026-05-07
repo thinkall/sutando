@@ -266,11 +266,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
+    def do_HEAD(self):
+        # Lightweight existence check used by the Windows web form to poll
+        # for /media/results/<id>.mp3 readiness without downloading the
+        # whole file on every poll. Only /media/ paths are polled this way.
+        # Other paths return 405 to avoid accidentally writing JSON bodies.
+        path = urlparse(self.path).path
+        if not path.startswith("/media/"):
+            self.send_response(405)
+            self.send_header("Allow", "GET, POST, OPTIONS")
+            self.end_headers()
+            return
+        # do_GET checks self.command == "HEAD" and skips the body write.
+        self.do_GET()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
         elif path == "/core-status":
+            if not self.check_auth():
+                return
             # Read loop status file for web UI
             status_file = REPO_DIR / "core-status.json"
             if status_file.exists():
@@ -283,10 +299,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"status": "idle"})
         elif path == "/voice/state":
+            if not self.check_auth():
+                return
             self.send_json(200, {"state": voice_desired_state})
         elif path == "/status":
+            if not self.check_auth():
+                return
             self.send_json(200, get_status())
         elif path == "/tasks/active":
+            # Lists in-flight task previews & status. When API_TOKEN is set
+            # this MUST be auth-gated — it returns the same result text as
+            # /result/<id>. (No-op when token unset → preserves Mac default.)
+            if not self.check_auth():
+                return
             # List active tasks + system status for the web client
             watcher_ok = subprocess.run(["pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
             claude_ok = subprocess.run(["pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
@@ -358,7 +383,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             questions = []
             pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
             if pq_file.exists():
-                import re
                 content = pq_file.read_text()
                 # Split into sections by ## headers
                 sections = re.split(r'^## ', content, flags=re.MULTILINE)
@@ -385,6 +409,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
         elif path.startswith("/result/"):
+            # Auth-gate result text — when SUTANDO_API_TOKEN is set, we don't
+            # want anyone on the LAN to be able to read prior results just
+            # by guessing task-<ms-timestamp>. No-op when the token is unset.
+            if not self.check_auth():
+                return
             task_id = path[len("/result/"):]
             result = get_task_result(task_id)
             if result:
@@ -407,6 +436,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = json.loads(si_file.read_text()) if si_file.exists() else {}
             self.send_json(200, data)
         elif path == "/activity":
+            # Auth-gate: this surfaces previews of recent result files.
+            if not self.check_auth():
+                return
             # Recent activity: git commits + processed tasks
             activity = []
             try:
@@ -431,6 +463,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
             self.send_json(200, {"activity": activity})
         elif path == "/contextual-chips":
+            if not self.check_auth():
+                return
             chips_file = REPO_DIR / "contextual-chips.json"
             if chips_file.exists():
                 try:
@@ -441,6 +475,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {"chips": []})
         elif path == "/dynamic-content":
+            if not self.check_auth():
+                return
             dc_file = REPO_DIR / "dynamic-content.json"
             if dc_file.exists():
                 try:
@@ -451,6 +487,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 self.send_json(200, {})
         elif path.startswith("/media/"):
+            # Auth-gate media — same reason as /result/. The Windows web
+            # form's <audio src> includes ?token=... so it authenticates via
+            # the query-param fallback in check_auth(). No-op when no token.
+            if not self.check_auth():
+                return
             # Serve local files for dynamic region (images, audio, video, docs)
             # Note: mimetypes import removed — replaced by SAFE_TYPES allowlist (CodeQL #19-23 mitigation)
             rel = path[len("/media/"):]
@@ -485,11 +526,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mime = SAFE_TYPES.get(ext, 'application/octet-stream')
             self.send_response(200)
             self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(media_path.stat().st_size))
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "public, max-age=300")
+            # When auth is configured, treat /media as user-private — keep
+            # the response out of shared / proxy caches.
+            cache_ctl = "private, max-age=300" if API_TOKEN else "public, max-age=300"
+            self.send_header("Cache-Control", cache_ctl)
             self.end_headers()
+            if self.command == "HEAD":
+                return
             self.wfile.write(media_path.read_bytes())
         elif path == "/logs/voice":
+            # Auth-gate: voice-agent log can contain transcripts of
+            # private user speech / task content.
+            if not self.check_auth():
+                return
             # Return last 30 lines of voice-agent.log for debugging
             log_file = REPO_DIR / "src" / "voice-agent.log"
             if log_file.exists():
@@ -507,12 +558,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not found"})
 
     def check_auth(self) -> bool:
-        """Check API token if configured. Returns True if authorized."""
+        """Check API token if configured. Returns True if authorized.
+
+        Accepts the token via either:
+          - `Authorization: Bearer <token>` header (preferred for fetch/XHR), or
+          - `?token=<token>` URL query parameter (needed for HTML elements
+            like `<audio src=...>` and `<img>` that can't set custom headers).
+
+        When SUTANDO_API_TOKEN is unset, all requests are accepted (the
+        traditional loopback-only behaviour).
+        """
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
         import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[len("Bearer "):].strip()
+        else:
+            token = ""
+        if not token:
+            # Fall back to ?token= query param for HTML elements that can't
+            # set Authorization headers (<audio src>, <img>, <link>).
+            try:
+                from urllib.parse import parse_qs
+                qs = parse_qs(urlparse(self.path).query)
+                token = (qs.get("token") or [""])[0]
+            except Exception:
+                token = ""
+        try:
+            # compare_digest raises TypeError on non-ASCII str; encode to
+            # bytes so a malformed query token returns 401, not 500.
+            ok = bool(token) and _hmac.compare_digest(
+                token.encode("utf-8", "ignore"),
+                API_TOKEN.encode("utf-8", "ignore"),
+            )
+        except Exception:
+            ok = False
+        if ok:
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
@@ -672,7 +754,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if pq_file.exists():
                     content = pq_file.read_text()
                     # Update status from unanswered to answered
-                    import re
                     safe_answer = answer.replace('\n', ' ')
                     # Try new format: - **Status:** unanswered
                     pattern = rf'(## [^\n]*\n(?:.*?\n)*?- \*\*Status:\*\* )unanswered'
@@ -780,57 +861,221 @@ TASK_FORM = """<!DOCTYPE html>
 <title>Sutando</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,sans-serif;background:#0a0a12;color:#e8e8e8;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{max-width:400px;width:100%;background:#12121e;border:1px solid #1e1e30;border-radius:12px;padding:28px}
-.header{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-.avatar{width:48px;height:48px;border-radius:50%;border:2px solid #4ecca3;object-fit:cover;display:none}
-h1{font-size:16px;font-weight:500;color:#fff;margin-bottom:2px}
-.sub{font-size:11px;color:#555}
-textarea{width:100%;background:#0a0a12;border:1px solid #1e1e30;border-radius:8px;padding:12px;color:#e8e8e8;font-size:14px;font-family:inherit;min-height:100px;resize:vertical;margin-bottom:16px}
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0a0a12;color:#e8e8e8;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:20px}
+.card{max-width:520px;width:100%;background:#12121e;border:1px solid #1e1e30;border-radius:12px;padding:24px;margin-top:24px}
+.header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.avatar{width:40px;height:40px;border-radius:50%;border:2px solid #4ecca3;object-fit:cover;display:none}
+h1{font-size:16px;font-weight:600;color:#fff}
+.sub{font-size:11px;color:#6a6a85;margin-top:2px}
+textarea{width:100%;background:#0a0a12;border:1px solid #1e1e30;border-radius:8px;padding:12px;color:#e8e8e8;font-size:15px;font-family:inherit;min-height:120px;resize:vertical;margin-bottom:12px;line-height:1.45}
 textarea:focus{outline:none;border-color:#4ecca3}
-button{width:100%;background:#1a2e24;color:#4ecca3;border:1px solid #2a4a36;border-radius:8px;padding:12px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit}
+button{width:100%;background:#1a2e24;color:#4ecca3;border:1px solid #2a4a36;border-radius:8px;padding:12px;font-size:15px;font-weight:600;cursor:pointer;font-family:inherit}
 button:hover{background:#243e30}
-.result{margin-top:16px;padding:12px;background:#0e1a14;border:1px solid #1a3a26;border-radius:8px;font-size:13px;color:#4ecca3;display:none}
+button:disabled{opacity:.5;cursor:not-allowed}
+.task-list{margin-top:20px}
+.task{border:1px solid #1e1e30;border-radius:8px;padding:12px;margin-top:10px;background:#0d0d18}
+.task-head{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:#6a6a85;margin-bottom:8px}
+.task-status{padding:2px 8px;border-radius:4px;font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.05em}
+.task-status.working{background:#2e2516;color:#e8b554}
+.task-status.done{background:#1a2e24;color:#4ecca3}
+.task-status.error{background:#2e1a1a;color:#e85;border:1px solid #4a2626}
+.task-prompt{color:#a8a8c0;font-size:13px;margin-bottom:8px;white-space:pre-wrap;word-break:break-word}
+.task-result{color:#e8e8e8;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+.task-audio{margin-top:10px}
+.task-audio audio{width:100%;height:36px}
+.audio-status{font-size:11px;color:#6a6a85;margin-top:6px}
+a{color:#4ecca3}
 </style></head><body>
 <div class="card">
 <div class="header">
 <img class="avatar" id="avatar" src="/avatar">
 <div><h1 id="stand-name">Sutando</h1>
-<p class="sub" id="stand-sub">Send a task from any device</p></div>
+<p class="sub" id="stand-sub">Type or dictate a task</p></div>
 </div>
-<textarea id="task" placeholder="What do you need?"></textarea>
-<button onclick="send()">Send Task</button>
-<div class="result" id="result"></div>
+<textarea id="task" placeholder="What do you need? (Tap mic on your phone keyboard to dictate.)"></textarea>
+<button id="send" onclick="send()">Send Task</button>
+<div class="task-list" id="task-list"></div>
 </div>
 <script>
-fetch('/stand-identity').then(r=>r.json()).then(s=>{
+// Token-from-URL: when the agent-api binds to LAN it requires
+// SUTANDO_API_TOKEN, and this form picks the token up from ?token=XXX
+// (sent as `Authorization: Bearer <token>` on every fetch, and as a
+// `?token=` query parameter on `<audio src=...>` for HTML elements that
+// can't set custom headers).
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const HDR = TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {};
+function jhdr() { return Object.assign({'Content-Type':'application/json'}, HDR); }
+
+fetch('/stand-identity', {headers: HDR}).then(r=>r.json()).then(s=>{
   if(s.name)document.getElementById('stand-name').textContent='Sutando — '+s.name;
   if(s.avatarGenerated)document.getElementById('avatar').style.display='block';
 }).catch(()=>{});
-async function send(){
-  const task=document.getElementById('task').value.trim();
-  if(!task)return;
-  const r=await fetch('/task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:'mobile',task})});
-  const d=await r.json();
-  const el=document.getElementById('result');
-  el.textContent=d.ok?'Sent: '+d.task_id:'Error: '+(d.error||'unknown');
-  el.style.display='block';
-  if(d.ok)document.getElementById('task').value='';
+
+// Track tasks submitted in this browser session so we can render & poll
+// each one independently. Keyed by task_id.
+const tasks = new Map();
+
+function el(tag, attrs={}, ...children){
+  const e=document.createElement(tag);
+  for(const[k,v]of Object.entries(attrs)){
+    if(k==='class')e.className=v;
+    else if(k==='html')e.innerHTML=v;
+    else e.setAttribute(k,v);
+  }
+  for(const c of children)e.appendChild(typeof c==='string'?document.createTextNode(c):c);
+  return e;
 }
+
+function renderTask(id, state){
+  const list=document.getElementById('task-list');
+  let card=document.getElementById('t-'+id);
+  if(!card){
+    card=el('div',{class:'task',id:'t-'+id});
+    list.insertBefore(card, list.firstChild);
+  }
+  card.innerHTML='';
+  const status=el('span',{class:'task-status '+state.status}, state.status);
+  const head=el('div',{class:'task-head'}, el('span',{},id), status);
+  card.appendChild(head);
+  card.appendChild(el('div',{class:'task-prompt'}, state.prompt));
+  if(state.result){
+    card.appendChild(el('div',{class:'task-result'}, state.result));
+  }
+  if(state.audioUrl){
+    const wrap=el('div',{class:'task-audio'});
+    const audio=el('audio',{controls:'controls',src:state.audioUrl,preload:'metadata'});
+    wrap.appendChild(audio);
+    card.appendChild(wrap);
+  } else if(state.status==='done'){
+    card.appendChild(el('div',{class:'audio-status'}, state.audioStatus||'Generating audio…'));
+  }
+}
+
+async function pollResult(id){
+  const state=tasks.get(id);
+  if(!state)return;
+  try{
+    const r=await fetch('/result/'+encodeURIComponent(id), {headers: HDR});
+    if(r.status===200){
+      const d=await r.json();
+      if(d.status==='completed'){
+        state.status='done';
+        state.result=d.result;
+        renderTask(id, state);
+        // Now poll for the audio file (TTS watcher writes it after the .txt).
+        pollAudio(id);
+        return;
+      }
+    }
+  }catch(e){/* ignore — keep polling */}
+  setTimeout(()=>pollResult(id), 2000);
+}
+
+async function pollAudio(id){
+  const state=tasks.get(id);
+  if(!state)return;
+  const url='/media/results/'+encodeURIComponent(id)+'.mp3';
+  // HEAD to check existence without downloading.
+  let attempts=0;
+  const maxAttempts=60; // ~2 min
+  const tick=async()=>{
+    attempts++;
+    try{
+      const r=await fetch(url, {method:'HEAD', headers: HDR});
+      if(r.status===200){
+        state.audioUrl=url+(TOKEN?'?token='+encodeURIComponent(TOKEN):'');
+        // <audio> elements can't set Authorization headers, so /media/
+        // accepts the token as a query parameter.
+        renderTask(id, state);
+        return;
+      }
+    }catch(e){/* ignore */}
+    if(attempts<maxAttempts){
+      state.audioStatus='Generating audio… ('+attempts+')';
+      renderTask(id, state);
+      setTimeout(tick, 2000);
+    } else {
+      state.audioStatus='(audio unavailable — text result above)';
+      renderTask(id, state);
+    }
+  };
+  tick();
+}
+
+async function send(){
+  const ta=document.getElementById('task');
+  const btn=document.getElementById('send');
+  const text=ta.value.trim();
+  if(!text)return;
+  btn.disabled=true; btn.textContent='Sending…';
+  try{
+    const r=await fetch('/task',{method:'POST',headers:jhdr(),body:JSON.stringify({from:'web',task:text})});
+    const d=await r.json();
+    if(d.ok){
+      tasks.set(d.task_id, {prompt:text, status:'working', result:'', audioUrl:'', audioStatus:''});
+      renderTask(d.task_id, tasks.get(d.task_id));
+      ta.value='';
+      pollResult(d.task_id);
+    } else {
+      alert('Error: '+(d.error||'unknown'));
+    }
+  } catch(e){
+    alert('Network error: '+e.message);
+  } finally {
+    btn.disabled=false; btn.textContent='Send Task';
+  }
+}
+
+// Submit on Ctrl+Enter / Cmd+Enter.
+document.getElementById('task').addEventListener('keydown', e=>{
+  if((e.ctrlKey||e.metaKey)&&e.key==='Enter')send();
+});
 </script></body></html>"""
 
 
 if __name__ == "__main__":
     bind = os.environ.get("AGENT_API_BIND", "127.0.0.1")
-    server = http.server.HTTPServer((bind, PORT), Handler)
+
+    # Refuse LAN binding without an API token. Sutando's task runner executes
+    # arbitrary prompts through Copilot CLI with --allow-all-tools, so an
+    # unauthenticated /task endpoint exposed on the LAN is effectively remote
+    # code execution. Loopback (127.0.0.1) is always safe.
+    if bind not in ("127.0.0.1", "::1", "localhost") and not API_TOKEN:
+        sys.stderr.write(
+            f"\n!! REFUSING TO START: AGENT_API_BIND={bind} but SUTANDO_API_TOKEN is not set.\n"
+            f"   Binding /task to a non-loopback interface without auth lets any device on\n"
+            f"   the LAN run arbitrary commands through Copilot CLI. Set SUTANDO_API_TOKEN\n"
+            f"   in .env (any random string) and access the form via /?token=<token>.\n\n"
+        )
+        sys.exit(2)
+
+    # ThreadingHTTPServer (instead of HTTPServer) so a slow /media/<id>.mp3
+    # stream from a phone doesn't block concurrent /result polls. The default
+    # single-threaded server feels sluggish for the Windows web-form path
+    # where one client is doing both at once.
+    server = http.server.ThreadingHTTPServer((bind, PORT), Handler)
     import socket
-    local_ip = socket.gethostbyname(socket.gethostname())
-    print(f"Sutando Agent API → http://{bind}:{PORT}")
-    print(f"  POST /task  — submit a task")
-    print(f"  GET  /status — health + capabilities")
-    print(f"  GET  /ping   — alive check")
-    if bind == "127.0.0.1":
-        print(f"  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = "<lan-ip>"
+    # Force UTF-8 on stdout so banner emoji/arrows don't blow up under
+    # Windows' default cp1252 console encoding (e.g. when redirected to a
+    # log file by Start-Process).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    print(f"Sutando Agent API -> http://{bind}:{PORT}")
+    print(f"  POST /task  - submit a task")
+    print(f"  GET  /status - health + capabilities")
+    print(f"  GET  /ping   - alive check")
+    if bind in ("127.0.0.1", "::1", "localhost"):
+        print(f"  (localhost only - set AGENT_API_BIND=0.0.0.0 + SUTANDO_API_TOKEN for LAN access)")
+    else:
+        token_param = f"?token={API_TOKEN}" if API_TOKEN else ""
+        print(f"  LAN access from phone:  http://{local_ip}:{PORT}/{token_param}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

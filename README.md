@@ -101,6 +101,10 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 
 ## Quick start
 
+> **On Windows? Or no Claude Code subscription?** See [`docs/WINDOWS.md`](docs/WINDOWS.md)
+> for the Windows + GitHub Copilot CLI port — text-task loop only (no voice /
+> phone / Mac-only skills). No Anthropic key, no Gemini key, no Twilio.
+
 **Prerequisites:**
 - macOS 15+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)

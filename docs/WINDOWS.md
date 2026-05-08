@@ -126,18 +126,25 @@ Both your PC and phone need to be on the same Wi-Fi.
    ```
 2. `copilot-task-runner.mjs` polls `tasks/` every 500 ms, sees the new file
    once its size+mtime is stable for two polls (avoids racing the writer).
-3. Runner spawns `copilot -p <wrapper> --allow-all-tools --no-ask-user --add-dir <repo> -s`.
-   The wrapper prompt is fixed text that tells Copilot to read the task
-   file from disk (so arbitrary user content never has to be escaped onto
-   the command line). Copilot reads the file via its built-in tools.
-   Output is captured to `results/<id>.txt` (atomic `.tmp` + rename).
+3. Runner spawns `copilot --output-format json --no-color -p <wrapper>
+   --allow-all-tools --no-ask-user --add-dir <repo>`. The wrapper prompt is
+   fixed text that tells Copilot to read the task file from disk (so
+   arbitrary user content never has to be escaped onto the command line).
+   Copilot reads the file via its built-in tools. JSONL output is parsed
+   line-by-line: `assistant.message_delta` events stream tokens into
+   `results/<id>.partial`, and the canonical text from the final
+   `assistant.message` event is written atomically to `results/<id>.txt`
+   when the process exits.
 4. The task file is moved to `tasks/archive/YYYY-MM/<id>.txt`.
 5. `edge-tts-watcher.py` sees the new `<id>.txt` once it's stable, calls
    `edge_tts.Communicate(...).save("<id>.mp3")` (atomic write).
-6. The browser polls `GET /result/<id>` every 2 s. When it returns
-   `status: completed`, the form polls `HEAD /media/results/<id>.mp3` until
-   200, then renders an `<audio controls>` element. No autoplay — phones
-   suppress autoplay across async polls.
+6. The browser opens `EventSource('/stream/<id>')` and live-renders each
+   `event: chunk` as Copilot generates it. When the SSE `event: done`
+   arrives (final answer ready), the form polls `HEAD /media/results/<id>.mp3`
+   until it's 200, then **autoplays** the audio. Autoplay works because
+   the form pre-warms an `<audio>` element with a silent placeholder
+   inside the Send-button click handler, claiming user-activation that
+   persists until the real mp3 is set later.
 
 ### Reliability features
 

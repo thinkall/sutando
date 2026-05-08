@@ -31,6 +31,7 @@ Security: Set SUTANDO_API_TOKEN in .env for token auth (Authorization: Bearer <t
 For remote access: use ngrok or SSH tunnel.
 """
 
+import codecs
 import http.server
 import ipaddress
 import json
@@ -39,6 +40,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -165,7 +167,7 @@ def get_task_result(task_id: str):
     """Check if a task result exists."""
     result_file = _safe_path(RESULT_DIR, task_id)
     if result_file and result_file.exists():
-        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text()}
+        return {"task_id": _safe_id(task_id), "status": "completed", "result": result_file.read_text(encoding="utf-8", errors="replace")}
     task_file = _safe_path(TASK_DIR, task_id)
     if task_file and task_file.exists():
         return {"task_id": _safe_id(task_id), "status": "pending"}
@@ -420,6 +422,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, result)
             else:
                 self.send_json(404, {"error": "task not found"})
+        elif path.startswith("/stream/"):
+            # Server-Sent Events — tail results/<id>.partial as the runner
+            # writes Copilot's `assistant.message_delta` chunks to it, then
+            # finalize with the canonical text from results/<id>.txt.
+            #
+            # The browser uses EventSource() which can't set Authorization
+            # headers, so the form passes the token via ?token=… (handled
+            # by the query-param branch in check_auth()).
+            if not self.check_auth():
+                return
+            self.handle_stream(path[len("/stream/"):])
         elif path == "/avatar":
             avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
             if avatar_file.exists():
@@ -557,6 +570,146 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_json(404, {"error": "not found"})
 
+    def handle_stream(self, raw_id: str):
+        """Stream a task's live transcript via Server-Sent Events.
+
+        Emits these SSE event types to the client:
+          - `event: chunk` with `data: <json-encoded string>` for each new
+            byte range read from `results/<id>.partial`. Each chunk is
+            tagged with `id: <byte_offset>` so EventSource's automatic
+            reconnect can resume via `Last-Event-ID` instead of replaying
+            the whole partial from offset zero (which would duplicate
+            everything in the client's accumulated text).
+          - `event: done` with `data: {"result": <final-text>}` when
+            `results/<id>.txt` appears. Client replaces the streamed text
+            with the canonical version (typically identical, but cleaner
+            for multi-turn tool-using tasks where intermediate messages
+            were streamed).
+          - `event: fatal` (deliberately not "error" — EventSource treats
+            its own "error" event as transient and silently auto-retries,
+            so we use a distinct name for terminal server-side failures
+            the client must surface).
+
+        Heartbeats (`: hb`) are sent every ~15s so phones / aggressive
+        proxies don't drop the connection during long Copilot turns.
+
+        Concurrency: this method blocks the request thread for up to 10
+        minutes. ThreadingHTTPServer (already configured below) handles
+        each connection on its own thread, so the blocking is fine.
+
+        UTF-8 safety: deltas may land on multi-byte character boundaries
+        between polling reads. We use an incremental decoder so a split
+        character is buffered until its remaining bytes arrive, instead
+        of being replaced with U+FFFD on every poll.
+        """
+        # Sanitize: same allowlist as _safe_path so a malicious id can't
+        # walk out of the results/ directory or smuggle null bytes.
+        safe_id = re.sub(r'[^a-zA-Z0-9_\-.]', '', raw_id)
+        if not safe_id or safe_id != raw_id:
+            self.send_json(400, {"error": "invalid id"})
+            return
+
+        partial = RESULT_DIR / f"{safe_id}.partial"
+        final = RESULT_DIR / f"{safe_id}.txt"
+
+        # Resume support: EventSource sends Last-Event-ID after a transient
+        # disconnect. We use the byte offset into the partial file as the
+        # ID so resume is just a seek().
+        try:
+            pos = max(0, int(self.headers.get("Last-Event-ID", "0")))
+        except (ValueError, TypeError):
+            pos = 0
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            # nginx / reverse-proxy hint: don't buffer SSE responses.
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+        def write(payload: bytes) -> bool:
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        def emit(event: str, data, event_id: int = None) -> bool:
+            blob = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            header = b""
+            if event_id is not None:
+                header += f"id: {event_id}\n".encode("utf-8")
+            header += f"event: {event}\n".encode("utf-8") + b"data: "
+            return write(header + blob + b"\n\n")
+
+        # Initial nudge so the client's `onopen` fires quickly even if Copilot
+        # is still spinning up MCP servers and hasn't emitted any deltas yet.
+        if not write(b": ok\n\n"):
+            return
+
+        deadline = time.time() + 600  # 10 min hard cap
+        last_send = time.time()
+
+        while time.time() < deadline:
+            # Check final FIRST so we never miss the done event when the
+            # runner deletes partial just after writing final.
+            final_exists = final.exists()
+
+            # Drain any new bytes from partial.
+            try:
+                if partial.exists():
+                    with open(partial, "rb") as f:
+                        f.seek(pos)
+                        chunk = f.read()
+                        if chunk:
+                            new_pos = pos + len(chunk)
+                            txt = decoder.decode(chunk, final=False)
+                            # Skip emitting if the chunk was entirely a
+                            # mid-character byte run (decoder buffered it).
+                            if txt:
+                                if not emit("chunk", txt, event_id=new_pos):
+                                    return
+                                last_send = time.time()
+                            pos = new_pos
+            except (FileNotFoundError, OSError):
+                # Partial vanished mid-read (runner finished + cleaned up);
+                # next iteration will see final and exit cleanly.
+                pass
+
+            if final_exists:
+                # Flush any remaining buffered bytes from the decoder so
+                # the live stream isn't missing a trailing partial char.
+                try:
+                    tail = decoder.decode(b"", final=True)
+                    if tail:
+                        emit("chunk", tail, event_id=pos)
+                except Exception:
+                    pass
+                try:
+                    text = final.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    text = ""
+                emit("done", {"result": text})
+                return
+
+            # Heartbeat to keep the connection warm during long thinking.
+            if time.time() - last_send > 15:
+                if not write(b": hb\n\n"):
+                    return
+                last_send = time.time()
+
+            time.sleep(0.2)
+
+        emit("fatal", {"error": "stream timeout (10 min)"})
+
     def check_auth(self) -> bool:
         """Check API token if configured. Returns True if authorized.
 
@@ -621,7 +774,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"from: {caller}\n"
             f"call_sid: {call_sid}\n"
         )
-        (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        (TASK_DIR / f"{task_id}.txt").write_text(task_content, encoding="utf-8")
 
         # TwiML: greet caller, record message
         self.send_twiml(
@@ -649,7 +802,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f"source: twilio_sms\n"
             f"from: {sender}\n"
         )
-        (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        (TASK_DIR / f"{task_id}.txt").write_text(task_content, encoding="utf-8")
 
         # Reply with acknowledgment
         self.send_twiml(
@@ -672,7 +825,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 f"source: twilio_voicemail\n"
                 f"from: {caller}\n"
             )
-            (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+            (TASK_DIR / f"{task_id}.txt").write_text(task_content, encoding="utf-8")
         self.send_json(200, {"ok": True})
 
     def do_POST(self):
@@ -842,7 +995,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Write to tasks/ for sutando-core to pick up
         task_id = f"task-{int(datetime.now().timestamp() * 1000)}"
         task_content = f"id: {task_id}\ntimestamp: {datetime.now().isoformat()}\ntask: {task}\nsource: api\nfrom: {from_agent}\n"
-        (TASK_DIR / f"{task_id}.txt").write_text(task_content)
+        (TASK_DIR / f"{task_id}.txt").write_text(task_content, encoding="utf-8")
 
         # Register webhook callback if provided
         if callback_url:
@@ -904,7 +1057,16 @@ a{color:#4ecca3}
 // can't set custom headers).
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const HDR = TOKEN ? {'Authorization': 'Bearer ' + TOKEN} : {};
+const Q_TOKEN = TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '';
 function jhdr() { return Object.assign({'Content-Type':'application/json'}, HDR); }
+
+// 44-byte minimal valid silent WAV (RIFF/WAVE, 1ch, 8-bit, 22050Hz, 0
+// data samples). Used solely as a placeholder source so we can call
+// audio.play() inside the click handler — once the element has been
+// "user-activated" in a gesture, later play() calls (after the real mp3
+// arrives via setTimeout/EventSource callbacks) are allowed by every
+// browser's autoplay policy, including iOS Safari.
+const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAVFYAAFRWAAABAAgAZGF0YQAAAAA=';
 
 fetch('/stand-identity', {headers: HDR}).then(r=>r.json()).then(s=>{
   if(s.name)document.getElementById('stand-name').textContent='Sutando — '+s.name;
@@ -912,7 +1074,10 @@ fetch('/stand-identity', {headers: HDR}).then(r=>r.json()).then(s=>{
 }).catch(()=>{});
 
 // Track tasks submitted in this browser session so we can render & poll
-// each one independently. Keyed by task_id.
+// each one independently. Keyed by task_id. Each value is:
+//   { prompt, status, result, audioStatus, audioEl, es }
+// where audioEl is the warmed-up <audio> element (created in the click
+// gesture for autoplay) and es is the active EventSource (if any).
 const tasks = new Map();
 
 function el(tag, attrs={}, ...children){
@@ -926,77 +1091,191 @@ function el(tag, attrs={}, ...children){
   return e;
 }
 
-function renderTask(id, state){
-  const list=document.getElementById('task-list');
+// Build the per-task card ONCE so subsequent updates can mutate text
+// in place without flicker (and so the <audio> element kept in
+// state.audioEl stays mounted across re-renders, preserving its
+// user-activation autoplay grant).
+function ensureCard(id, state){
   let card=document.getElementById('t-'+id);
-  if(!card){
-    card=el('div',{class:'task',id:'t-'+id});
-    list.insertBefore(card, list.firstChild);
-  }
-  card.innerHTML='';
-  const status=el('span',{class:'task-status '+state.status}, state.status);
-  const head=el('div',{class:'task-head'}, el('span',{},id), status);
+  if(card)return card;
+  const list=document.getElementById('task-list');
+  card=el('div',{class:'task',id:'t-'+id});
+  const head=el('div',{class:'task-head'},
+    el('span',{}, id),
+    el('span',{class:'task-status '+state.status,'data-role':'status'}, state.status));
   card.appendChild(head);
   card.appendChild(el('div',{class:'task-prompt'}, state.prompt));
-  if(state.result){
-    card.appendChild(el('div',{class:'task-result'}, state.result));
-  }
-  if(state.audioUrl){
-    const wrap=el('div',{class:'task-audio'});
-    const audio=el('audio',{controls:'controls',src:state.audioUrl,preload:'metadata'});
-    wrap.appendChild(audio);
-    card.appendChild(wrap);
-  } else if(state.status==='done'){
-    card.appendChild(el('div',{class:'audio-status'}, state.audioStatus||'Generating audio…'));
-  }
+  card.appendChild(el('div',{class:'task-result','data-role':'result'}));
+  card.appendChild(el('div',{class:'task-audio','data-role':'audio'}));
+  card.appendChild(el('div',{class:'audio-status','data-role':'audio-status'}));
+  list.insertBefore(card, list.firstChild);
+  return card;
 }
 
-async function pollResult(id){
+function updateCard(id, state){
+  const card=ensureCard(id, state);
+  const st=card.querySelector('[data-role=status]');
+  st.textContent=state.status;
+  st.className='task-status '+state.status;
+  card.querySelector('[data-role=result]').textContent=state.result;
+  card.querySelector('[data-role=audio-status]').textContent=state.audioStatus||'';
+}
+
+// Stream the live transcript via Server-Sent Events. Falls back to
+// /result polling if EventSource isn't available (very old browsers).
+function streamResult(id){
+  const state=tasks.get(id);
+  if(!state)return;
+  if(typeof EventSource==='undefined'){
+    pollResultFallback(id);
+    return;
+  }
+  const url='/stream/'+encodeURIComponent(id)+Q_TOKEN;
+  const es=new EventSource(url);
+  state.es=es;
+
+  es.addEventListener('chunk',(e)=>{
+    try{
+      const txt=JSON.parse(e.data);
+      state.result+=txt;
+      updateCard(id, state);
+    }catch(err){/* ignore malformed */}
+  });
+
+  es.addEventListener('done',(e)=>{
+    try{
+      const d=JSON.parse(e.data);
+      // Replace the streamed transcript with the canonical final answer
+      // (cleaner for tool-using tasks where intermediate messages were
+      // shown live but the user only wants the final reply).
+      if(typeof d.result==='string')state.result=d.result;
+    }catch(err){/* ignore */}
+    state.status='done';
+    state.audioStatus='Generating audio…';
+    updateCard(id, state);
+    es.close();
+    state.es=null;
+    pollAudio(id);
+  });
+
+  // Distinct event for terminal server-side failures (timeout, etc).
+  // Native EventSource treats its own "error" event as transient and will
+  // silently retry, so we use a custom event name the server can use to
+  // tell us "stop reconnecting, this is over".
+  es.addEventListener('fatal',(e)=>{
+    try{
+      const d=JSON.parse(e.data);
+      state.result=state.result||d.error||'(stream failed)';
+    }catch(err){
+      state.result=state.result||'(stream failed)';
+    }
+    state.status='error';
+    updateCard(id, state);
+    es.close();
+    state.es=null;
+  });
+
+  es.addEventListener('error',(e)=>{
+    // EventSource auto-reconnects on transient network errors. Only treat
+    // this as terminal if the connection moved to the CLOSED state.
+    if(es.readyState===EventSource.CLOSED){
+      // Final result might already be on disk — try a one-off poll
+      // before giving up so the user still gets their answer.
+      fetch('/result/'+encodeURIComponent(id),{headers:HDR}).then(r=>r.json()).then(d=>{
+        if(d&&d.status==='completed'){
+          state.result=d.result;
+          state.status='done';
+          updateCard(id, state);
+          pollAudio(id);
+        }else{
+          state.status='error';
+          state.result=state.result||'(stream connection lost)';
+          updateCard(id, state);
+        }
+      }).catch(()=>{
+        state.status='error';
+        state.result=state.result||'(stream connection lost)';
+        updateCard(id, state);
+      });
+    }
+  });
+}
+
+// Legacy polling fallback for ancient browsers without EventSource.
+async function pollResultFallback(id){
   const state=tasks.get(id);
   if(!state)return;
   try{
-    const r=await fetch('/result/'+encodeURIComponent(id), {headers: HDR});
+    const r=await fetch('/result/'+encodeURIComponent(id),{headers:HDR});
     if(r.status===200){
       const d=await r.json();
       if(d.status==='completed'){
         state.status='done';
         state.result=d.result;
-        renderTask(id, state);
-        // Now poll for the audio file (TTS watcher writes it after the .txt).
+        updateCard(id, state);
         pollAudio(id);
         return;
       }
     }
-  }catch(e){/* ignore — keep polling */}
-  setTimeout(()=>pollResult(id), 2000);
+  }catch(e){/* ignore */}
+  setTimeout(()=>pollResultFallback(id), 2000);
 }
 
 async function pollAudio(id){
   const state=tasks.get(id);
   if(!state)return;
   const url='/media/results/'+encodeURIComponent(id)+'.mp3';
-  // HEAD to check existence without downloading.
   let attempts=0;
   const maxAttempts=60; // ~2 min
   const tick=async()=>{
     attempts++;
     try{
-      const r=await fetch(url, {method:'HEAD', headers: HDR});
+      const r=await fetch(url,{method:'HEAD',headers:HDR});
       if(r.status===200){
-        state.audioUrl=url+(TOKEN?'?token='+encodeURIComponent(TOKEN):'');
-        // <audio> elements can't set Authorization headers, so /media/
-        // accepts the token as a query parameter.
-        renderTask(id, state);
+        const playUrl=url+Q_TOKEN;
+        // Mount the warmed-up <audio> element from the gesture into the
+        // card and point it at the real mp3. Setting .src + .play() on
+        // the SAME element that was activated during the click survives
+        // browser autoplay restrictions.
+        const card=document.getElementById('t-'+id);
+        const slot=card&&card.querySelector('[data-role=audio]');
+        const audio=state.audioEl;
+        if(audio){
+          audio.src=playUrl;
+          audio.controls=true;
+          audio.style.width='100%';
+          audio.style.height='36px';
+          if(slot){
+            slot.innerHTML='';
+            slot.appendChild(audio);
+          }
+          state.audioStatus='';
+          updateCard(id, state);
+          const p=audio.play();
+          if(p&&p.then){
+            p.catch(()=>{
+              state.audioStatus='Tap ▶ to play';
+              updateCard(id, state);
+            });
+          }
+        }else if(slot){
+          // Defensive: no warmed-up element (shouldn't happen). Mount a
+          // fresh one with controls; user will need to tap play.
+          slot.innerHTML='';
+          slot.appendChild(el('audio',{controls:'controls',src:playUrl,preload:'auto'}));
+          state.audioStatus='Tap ▶ to play';
+          updateCard(id, state);
+        }
         return;
       }
     }catch(e){/* ignore */}
     if(attempts<maxAttempts){
       state.audioStatus='Generating audio… ('+attempts+')';
-      renderTask(id, state);
+      updateCard(id, state);
       setTimeout(tick, 2000);
     } else {
       state.audioStatus='(audio unavailable — text result above)';
-      renderTask(id, state);
+      updateCard(id, state);
     }
   };
   tick();
@@ -1007,19 +1286,34 @@ async function send(){
   const btn=document.getElementById('send');
   const text=ta.value.trim();
   if(!text)return;
+
+  // STEP 1 — claim audio autoplay permission INSIDE the click gesture.
+  // Create the <audio> element and call .play() on a silent placeholder
+  // synchronously. This marks the element as user-activated, so when the
+  // real mp3 is set later (after fetch + SSE + tts) play() will succeed
+  // even though the user gesture has long since expired.
+  const audio = new Audio();
+  audio.preload = 'auto';
+  audio.playsInline = true; // iOS Safari: don't fullscreen the audio
+  audio.src = SILENT_WAV;
+  const warmup = audio.play();
+  if (warmup && warmup.then) warmup.catch(()=>{ /* warmup failures are non-fatal */ });
+
   btn.disabled=true; btn.textContent='Sending…';
   try{
     const r=await fetch('/task',{method:'POST',headers:jhdr(),body:JSON.stringify({from:'web',task:text})});
     const d=await r.json();
     if(d.ok){
-      tasks.set(d.task_id, {prompt:text, status:'working', result:'', audioUrl:'', audioStatus:''});
-      renderTask(d.task_id, tasks.get(d.task_id));
+      tasks.set(d.task_id, {prompt:text, status:'working', result:'', audioStatus:'', audioEl: audio, es: null});
+      updateCard(d.task_id, tasks.get(d.task_id));
       ta.value='';
-      pollResult(d.task_id);
+      streamResult(d.task_id);
     } else {
+      try{audio.pause();}catch(e){}
       alert('Error: '+(d.error||'unknown'));
     }
   } catch(e){
+    try{audio.pause();}catch(err){}
     alert('Network error: '+e.message);
   } finally {
     btn.disabled=false; btn.textContent='Send Task';

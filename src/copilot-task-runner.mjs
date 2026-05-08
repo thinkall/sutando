@@ -38,6 +38,7 @@
 
 import { spawn } from 'node:child_process';
 import {
+	createWriteStream,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
@@ -176,28 +177,60 @@ function spawnCopilot(args, options) {
 }
 
 /** Run copilot for one task. Always writes results/<id>.txt — success or
- * failure — so the polling UI never hangs. */
-async function runCopilot(taskId, taskFilePath) {
+ * failure — so the polling UI never hangs.
+ *
+ * Streaming model
+ * ---------------
+ * Copilot's `--output-format json` emits one JSON event per line (JSONL)
+ * including `assistant.message_delta` events that carry token-level
+ * `data.deltaContent` chunks AS THE MODEL EMITS THEM. We tee those chunks
+ * into `<id>.partial` so the SSE endpoint (`/stream/<id>`) can tail it and
+ * push live updates to the browser.
+ *
+ * Final-text source of truth: the LAST `assistant.message` event's
+ * `data.content` field is the canonical, fully-assembled answer (Copilot
+ * emits this once each turn settles). For multi-turn tasks (tool-use →
+ * follow-up reasoning → final answer), only the LAST message is what the
+ * user wants spoken/persisted, so we overwrite `finalMessage` on every
+ * `assistant.message` and use whatever was last set when the process closes.
+ *
+ * The `.partial` file is intentionally NOT named `.txt` so the TTS watcher
+ * (which globs `task-*.txt`) doesn't synthesise on partial drafts.
+ */
+async function runCopilot(taskId, taskFilePath, partialPath) {
 	const prompt = buildPrompt(taskFilePath);
 	const args = [
+		'--output-format', 'json',
+		'--no-color',
 		'-p', prompt,
 		'--allow-all-tools',
 		'--no-ask-user',
 		'--add-dir', REPO_DIR,
-		'-s',
 	];
 
-	log(`[${taskId}] spawning copilot (timeout ${Math.round(TASK_TIMEOUT_MS / 1000)}s)`);
+	log(`[${taskId}] spawning copilot (jsonl streaming, timeout ${Math.round(TASK_TIMEOUT_MS / 1000)}s)`);
+
+	// Truncate any stale partial from a previous run with the same ID.
+	try { unlinkSync(partialPath); } catch { /* ignore */ }
+	const partialStream = createWriteStream(partialPath, { flags: 'w' });
 
 	return new Promise((resolve) => {
-		let stdout = '';
 		let stderr = '';
+		let lineBuf = '';            // unfinished JSONL line carried between data chunks
+		let finalMessage = '';       // canonical: data.content from the LAST assistant.message
+		let deltaAccumulator = '';   // fallback: concatenated deltaContent across all turns
 		let timedOut = false;
 		let settled = false;
+		let messageCount = 0;        // count of assistant.message events seen (for separators)
+
+		const closePartial = () => {
+			try { partialStream.end(); } catch { /* ignore */ }
+		};
 
 		const settle = (val) => {
 			if (settled) return;
 			settled = true;
+			closePartial();
 			resolve(val);
 		};
 
@@ -213,7 +246,44 @@ async function runCopilot(taskId, taskFilePath) {
 			try { child.kill('SIGKILL'); } catch { /* ignore */ }
 		}, TASK_TIMEOUT_MS);
 
-		child.stdout.on('data', (d) => { stdout += d.toString(); });
+		const handleEvent = (evt) => {
+			const t = evt && evt.type;
+			if (!t) return;
+			if (t === 'assistant.message_delta') {
+				const txt = evt.data && evt.data.deltaContent;
+				if (typeof txt === 'string' && txt.length > 0) {
+					try { partialStream.write(txt); } catch { /* ignore */ }
+					deltaAccumulator += txt;
+				}
+			} else if (t === 'assistant.message') {
+				const content = evt.data && evt.data.content;
+				if (typeof content === 'string' && content.length > 0) {
+					finalMessage = content;
+				}
+				messageCount += 1;
+			} else if (t === 'tool.execution_start') {
+				// Surface a quiet status line so users see "something is happening"
+				// during long tool-using turns. The TTS engine ignores it because
+				// only the canonical finalMessage gets written to <id>.txt.
+				const name = (evt.data && (evt.data.toolName || evt.data.name)) || 'tool';
+				try { partialStream.write(`\n\n_[running ${name}…]_\n\n`); } catch { /* ignore */ }
+			}
+		};
+
+		child.stdout.on('data', (d) => {
+			lineBuf += d.toString('utf-8');
+			let nl;
+			while ((nl = lineBuf.indexOf('\n')) !== -1) {
+				const line = lineBuf.slice(0, nl).trim();
+				lineBuf = lineBuf.slice(nl + 1);
+				if (!line) continue;
+				let evt;
+				try { evt = JSON.parse(line); } catch { continue; }
+				try { handleEvent(evt); } catch (err) {
+					log(`[${taskId}] handleEvent error: ${err && err.message || err}`);
+				}
+			}
+		});
 		child.stderr.on('data', (d) => { stderr += d.toString(); });
 
 		child.on('error', (err) => {
@@ -227,22 +297,28 @@ async function runCopilot(taskId, taskFilePath) {
 
 		child.on('close', (code) => {
 			clearTimeout(timer);
-			const out = stdout.trim();
+			// Flush any final unterminated JSON line in the buffer.
+			const tail = lineBuf.trim();
+			if (tail) {
+				try { handleEvent(JSON.parse(tail)); } catch { /* ignore */ }
+			}
+			const finalText = (finalMessage || deltaAccumulator).trim();
 			if (timedOut) {
-				settle({ ok: false, text: `Task timed out after ${Math.round(TASK_TIMEOUT_MS / 1000)} seconds. Partial output:\n\n${out || '(none)'}` });
+				settle({ ok: false, text: `Task timed out after ${Math.round(TASK_TIMEOUT_MS / 1000)} seconds. Partial output:\n\n${finalText || '(none)'}` });
 				return;
 			}
 			if (code !== 0) {
-				const errMsg = `Copilot exited with code ${code}.\n\nSTDERR:\n${stderr.trim() || '(empty)'}\n\nSTDOUT:\n${out || '(empty)'}`;
+				const errMsg = `Copilot exited with code ${code}.\n\nSTDERR:\n${stderr.trim() || '(empty)'}\n\nPARTIAL ANSWER:\n${finalText || '(empty)'}`;
 				log(`[${taskId}] non-zero exit ${code}`);
 				settle({ ok: false, text: errMsg });
 				return;
 			}
-			if (!out) {
-				settle({ ok: false, text: `Copilot returned empty output. STDERR: ${stderr.trim() || '(none)'}` });
+			if (!finalText) {
+				settle({ ok: false, text: `Copilot produced no answer. STDERR: ${stderr.trim() || '(none)'}` });
 				return;
 			}
-			settle({ ok: true, text: out });
+			log(`[${taskId}] streamed ${messageCount} message(s), finalised ${finalText.length} chars`);
+			settle({ ok: true, text: finalText });
 		});
 	});
 }
@@ -252,11 +328,15 @@ async function processTask(filename) {
 	inFlight.add(filename);
 	const fullPath = join(TASK_DIR, filename);
 	const taskId = filename.replace(/\.txt$/, '');
+	const partialPath = join(RESULT_DIR, taskId + '.partial');
 	try {
 		const size = statSync(fullPath).size;
 		log(`[${taskId}] processing (${size} bytes)`);
-		const { ok, text } = await runCopilot(taskId, fullPath);
+		const { ok, text } = await runCopilot(taskId, fullPath, partialPath);
 		const resultPath = join(RESULT_DIR, filename);
+		// Write final FIRST, then unlink partial — so the SSE endpoint's
+		// "final exists?" check never observes a window where neither file
+		// is present. Order matters for the streaming UI's done event.
 		atomicWrite(resultPath, text);
 		log(`[${taskId}] result written (${text.length} chars, ${ok ? 'ok' : 'FAILED'})`);
 	} catch (err) {
@@ -265,6 +345,7 @@ async function processTask(filename) {
 			atomicWrite(join(RESULT_DIR, filename), `Internal error: ${err.message || err}`);
 		} catch { /* ignore */ }
 	} finally {
+		try { unlinkSync(partialPath); } catch { /* ignore */ }
 		archiveTask(filename);
 		archived.add(filename);
 		seenStats.delete(filename);

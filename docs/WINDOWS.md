@@ -49,10 +49,29 @@ Copy-Item .env.windows.example .env
 notepad .env
 
 # 3. Start everything
-pwsh src\startup.ps1
+.\sutando.cmd
 ```
 
-`startup.ps1` will:
+> **Even simpler: double-click `sutando.cmd` in Explorer.** The window
+> stays open so you can read the URL, then `pause` waits for any key.
+
+The `sutando.cmd` launcher wraps `src\startup.ps1` with a few QoL extras:
+
+```powershell
+.\sutando.cmd                   # start (default)
+.\sutando.cmd start --lan       # start, accept LAN connections
+.\sutando.cmd stop              # stop all 3 services
+.\sutando.cmd restart           # stop + start
+.\sutando.cmd status            # show which services are running
+.\sutando.cmd logs              # tail last 30 lines of every log
+.\sutando.cmd open              # open the web form in your default browser
+.\sutando.cmd help              # full reference
+```
+
+Add `--no-pause` to skip the "Press any key" prompt after `start` when
+running from a terminal or CI.
+
+`startup.ps1` (invoked under the hood) will:
 - Verify `node`, `python`, `copilot` are on PATH
 - Install `edge-tts` via pip (`python -m pip install --user edge-tts`)
 - Start three background services:
@@ -68,12 +87,12 @@ pwsh src\startup.ps1
 When it's up, open the URL it prints — **http://localhost:7843/** for
 local-only, or **http://YOUR.LAN.IP:7843/?token=...** if you enabled LAN
 access. Paste / dictate a task in the textarea, tap **Send Task**, and
-watch the result + audio appear.
+watch the result stream in token-by-token while the audio autoplays.
 
 ### Connecting from your phone
 
 1. In `.env`, set `AGENT_API_BIND=0.0.0.0` and `SUTANDO_API_TOKEN=<random>`.
-2. Restart: `pwsh src\startup.ps1 -Restart`
+2. Restart: `.\sutando.cmd restart --lan`
 3. Open the printed `http://YOUR.LAN.IP:7843/?token=...` on your phone.
 4. Bookmark / add to home screen.
 5. Tap the textarea, hit the mic icon on your phone keyboard, dictate.
@@ -104,6 +123,7 @@ Both your PC and phone need to be on the same Wi-Fi.
 
 | File | Role |
 |---|---|
+| `sutando.cmd` | Top-level launcher (double-clickable) — wraps `startup.ps1` with `status` / `logs` / `open` / `help` |
 | `src/startup.ps1` | Windows orchestrator — start/stop/restart all services |
 | `src/agent-api.py` | HTTP server (port 7843) — web form + `POST /task` endpoint |
 | `src/copilot-task-runner.mjs` | Node poller — runs Copilot CLI per task |
@@ -190,16 +210,20 @@ python -m edge_tts --list-voices | Select-String "Neural"
 
 ```powershell
 # Start
-pwsh src\startup.ps1
+.\sutando.cmd                          # or: pwsh src\startup.ps1
 
 # Stop
-pwsh src\startup.ps1 -Stop
+.\sutando.cmd stop                     # or: pwsh src\startup.ps1 -Stop
 
 # Restart
-pwsh src\startup.ps1 -Restart
+.\sutando.cmd restart                  # or: pwsh src\startup.ps1 -Restart
+
+# Health check (which services are running)
+.\sutando.cmd status
 
 # Tail logs
-Get-Content -Wait logs\agent-api.log
+.\sutando.cmd logs                     # quick: last 30 lines of each
+Get-Content -Wait logs\agent-api.log   # follow-mode
 Get-Content -Wait logs\task-runner.log
 Get-Content -Wait logs\tts-watcher.log
 

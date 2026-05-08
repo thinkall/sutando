@@ -104,6 +104,8 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 > **On Windows? Or no Claude Code subscription?** See [`docs/WINDOWS.md`](docs/WINDOWS.md)
 > for the Windows + GitHub Copilot CLI port — text-task loop only (no voice /
 > phone / Mac-only skills). No Anthropic key, no Gemini key, no Twilio.
+> Once cloned, you start everything with **`.\sutando.cmd`** (or just
+> double-click `sutando.cmd` in Explorer).
 
 **Prerequisites:**
 - macOS 15+

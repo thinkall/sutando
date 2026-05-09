@@ -433,6 +433,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not self.check_auth():
                 return
             self.handle_stream(path[len("/stream/"):])
+        elif path.startswith("/audio-stream/"):
+            # Server-Sent Events — tail results/<id>.parts.jsonl as the
+            # edge-tts watcher synthesises live audio chunks. Browser
+            # plays each part-N.mp3 in sequence for streaming TTS.
+            if not self.check_auth():
+                return
+            self.handle_audio_stream(path[len("/audio-stream/"):])
         elif path == "/avatar":
             avatar_file = personal_path("stand-avatar.png", workspace=REPO_DIR)
             if avatar_file.exists():
@@ -709,6 +716,174 @@ class Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(0.2)
 
         emit("fatal", {"error": "stream timeout (10 min)"})
+
+    def handle_audio_stream(self, raw_id: str):
+        """Stream a task's live audio manifest via Server-Sent Events.
+
+        The edge-tts watcher writes one JSON-line per chunk to
+        `results/<id>.parts.jsonl`:
+          - `{"seq":N,"chars":K,"bytes":B}` — part-N.mp3 ready
+          - `{"seq":N,"chars":K,"error":"tts_failed"}` — synthesis failed
+          - `{"done":true,"total":N,"final_url":"/media/results/<id>.mp3"}`
+
+        We tail this file, only emitting events for COMPLETE newline-
+        terminated lines (the writer appends atomically per-line, but on
+        rare concurrent reads we may catch an in-flight write — buffering
+        until '\\n' avoids JSON parse errors).
+
+        Events emitted to the browser:
+          - `event: part`  data: {seq,url,chars}        — playable chunk
+          - `event: skip`  data: {seq,reason,chars}     — synthesis failed,
+                                                          gap in audio
+          - `event: done`  data: {url,total}            — manifest complete
+          - `event: fatal` data: {error}                — server-side timeout
+
+        Last-Event-ID resume: byte offset into parts.jsonl (we only set
+        `id:` after a successfully parsed line, so it always points to a
+        record boundary).
+        """
+        safe_id = re.sub(r'[^a-zA-Z0-9_\-.]', '', raw_id)
+        if not safe_id or safe_id != raw_id:
+            self.send_json(400, {"error": "invalid id"})
+            return
+
+        manifest = RESULT_DIR / f"{safe_id}.parts.jsonl"
+        final_txt = RESULT_DIR / f"{safe_id}.txt"
+
+        try:
+            pos = max(0, int(self.headers.get("Last-Event-ID", "0")))
+        except (ValueError, TypeError):
+            pos = 0
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        def write(payload: bytes) -> bool:
+            try:
+                self.wfile.write(payload)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return False
+
+        def emit(event: str, data, event_id: int = None) -> bool:
+            blob = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            header = b""
+            if event_id is not None:
+                header += f"id: {event_id}\n".encode("utf-8")
+            header += f"event: {event}\n".encode("utf-8") + b"data: "
+            return write(header + blob + b"\n\n")
+
+        if not write(b": ok\n\n"):
+            return
+
+        deadline = time.time() + 600  # 10 min hard cap
+        last_send = time.time()
+        line_buf = b""
+        # Once we've emitted `done` we exit on the next iteration.
+        done_emitted = False
+        # If neither manifest nor final text appears for a while, the task
+        # may have completed without using chunk mode — close so the
+        # browser can fall back to polling /media/results/<id>.mp3.
+        no_manifest_grace = 5.0  # seconds after final txt before giving up
+        no_manifest_since = None
+
+        while time.time() < deadline and not done_emitted:
+            try:
+                if manifest.exists():
+                    no_manifest_since = None
+                    with open(manifest, "rb") as f:
+                        f.seek(pos)
+                        chunk = f.read()
+                    if chunk:
+                        line_buf += chunk
+                        # Process complete lines only.
+                        while True:
+                            nl = line_buf.find(b"\n")
+                            if nl < 0:
+                                break
+                            line, line_buf = line_buf[:nl], line_buf[nl + 1:]
+                            pos += nl + 1
+                            try:
+                                obj = json.loads(line.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                # Skip malformed line, keep advancing pos.
+                                continue
+                            if obj.get("done"):
+                                ok = emit("done", {
+                                    "url": obj.get("final_url", f"/media/results/{safe_id}.mp3"),
+                                    "total": obj.get("total", 0),
+                                }, event_id=pos)
+                                if not ok:
+                                    return
+                                last_send = time.time()
+                                done_emitted = True
+                                break
+                            seq = obj.get("seq")
+                            if seq is None:
+                                continue
+                            if obj.get("error"):
+                                if not emit("skip", {
+                                    "seq": seq,
+                                    "reason": obj.get("error"),
+                                    "chars": obj.get("chars", 0),
+                                }, event_id=pos):
+                                    return
+                            else:
+                                part_file = RESULT_DIR / f"{safe_id}.part-{seq}.mp3"
+                                if not part_file.is_file():
+                                    # Manifest claims part exists but the file
+                                    # is gone — skip rather than emit a dead URL.
+                                    if not emit("skip", {
+                                        "seq": seq,
+                                        "reason": "part_missing",
+                                        "chars": obj.get("chars", 0),
+                                    }, event_id=pos):
+                                        return
+                                else:
+                                    if not emit("part", {
+                                        "seq": seq,
+                                        "url": f"/media/results/{safe_id}.part-{seq}.mp3",
+                                        "chars": obj.get("chars", 0),
+                                    }, event_id=pos):
+                                        return
+                            last_send = time.time()
+                else:
+                    # No manifest yet. If the task already finalised (final
+                    # txt present), give it `no_manifest_grace` seconds for
+                    # the watcher to write a manifest, then signal done so
+                    # the browser falls back to the canonical mp3.
+                    if final_txt.exists():
+                        if no_manifest_since is None:
+                            no_manifest_since = time.time()
+                        elif time.time() - no_manifest_since > no_manifest_grace:
+                            emit("done", {
+                                "url": f"/media/results/{safe_id}.mp3",
+                                "total": 0,
+                            })
+                            done_emitted = True
+                            break
+            except (FileNotFoundError, OSError):
+                pass
+
+            if not done_emitted and time.time() - last_send > 15:
+                if not write(b": hb\n\n"):
+                    return
+                last_send = time.time()
+
+            if not done_emitted:
+                time.sleep(0.2)
+
+        if not done_emitted:
+            emit("fatal", {"error": "audio-stream timeout (10 min)"})
 
     def check_auth(self) -> bool:
         """Check API token if configured. Returns True if authorized.
@@ -1151,11 +1326,12 @@ function streamResult(id){
       if(typeof d.result==='string')state.result=d.result;
     }catch(err){/* ignore */}
     state.status='done';
-    state.audioStatus='Generating audio…';
     updateCard(id, state);
     es.close();
     state.es=null;
-    pollAudio(id);
+    // Audio is handled independently by streamAudio() (started in send()
+    // alongside this text stream). It will fall back to pollAudio() if
+    // no chunks arrive, so we don't need to poke it here.
   });
 
   // Distinct event for terminal server-side failures (timeout, etc).
@@ -1186,7 +1362,6 @@ function streamResult(id){
           state.result=d.result;
           state.status='done';
           updateCard(id, state);
-          pollAudio(id);
         }else{
           state.status='error';
           state.result=state.result||'(stream connection lost)';
@@ -1197,6 +1372,185 @@ function streamResult(id){
         state.result=state.result||'(stream connection lost)';
         updateCard(id, state);
       });
+    }
+  });
+}
+
+// Stream audio chunks via SSE on /audio-stream/<id>. The edge-tts watcher
+// writes one part-N.mp3 per sentence-ish chunk plus a manifest line; this
+// function queues those URLs and plays them sequentially through the
+// warmed-up <audio> element so audio starts before text finishes.
+//
+// Falls back to pollAudio (HEAD-poll the canonical /media/results/<id>.mp3)
+// when the server tells us no chunks were emitted (fast task → straight
+// full-text TTS) or when the SSE channel dies before any chunk arrives.
+function streamAudio(id){
+  const state=tasks.get(id);
+  if(!state)return;
+  if(typeof EventSource==='undefined'){
+    // Old browsers — wait for /result done then HEAD-poll the final mp3.
+    return;
+  }
+  state.audioQueue=[];
+  state.audioPlaying=false;
+  state.audioDone=false;
+  state.audioFinalUrl=null;
+  state.audioGotPart=false;
+
+  const audio=state.audioEl;
+  if(!audio)return;
+  // Mount the warmed-up element into the card immediately so it's visible
+  // (and stays the same DOM node across chunks — its user-activation
+  // grant survives the warm-up silent play earlier).
+  const card=document.getElementById('t-'+id);
+  const slot=card&&card.querySelector('[data-role=audio]');
+  if(slot){
+    audio.style.width='100%';
+    audio.style.height='36px';
+    audio.controls=false;
+    slot.innerHTML='';
+    slot.appendChild(audio);
+  }
+
+  function refreshStatus(){
+    if(state.audioPlaying){
+      const left=state.audioQueue.length;
+      state.audioStatus=left>0?('Playing… '+left+' chunk'+(left===1?'':'s')+' queued'):'Playing…';
+    }else if(state.audioDone){
+      state.audioStatus='';
+    }else if(state.audioGotPart){
+      state.audioStatus='Buffering…';
+    }else{
+      state.audioStatus='Generating audio…';
+    }
+    updateCard(id, state);
+  }
+  refreshStatus();
+
+  function startNext(){
+    if(state.audioPlaying)return;
+    if(state.audioQueue.length===0){
+      if(state.audioDone)finalizeAudio();
+      else refreshStatus();
+      return;
+    }
+    const url=state.audioQueue.shift();
+    state.audioPlaying=true;
+    audio.controls=false;
+    audio.src=url;
+    refreshStatus();
+    const p=audio.play();
+    if(p&&p.then){
+      p.catch(()=>{
+        // Autoplay blocked. Surface controls on the current chunk so the
+        // user can tap play; queue keeps growing in the background.
+        audio.controls=true;
+        state.audioStatus='Tap ▶ to play';
+        updateCard(id, state);
+      });
+    }
+  }
+
+  function onEnded(){
+    state.audioPlaying=false;
+    startNext();
+  }
+  function onPlayError(){
+    // Network / decode error on this chunk — skip it.
+    state.audioPlaying=false;
+    startNext();
+  }
+  audio.addEventListener('ended', onEnded);
+  audio.addEventListener('error', onPlayError);
+  state.audioListeners={ended:onEnded, error:onPlayError};
+
+  function finalizeAudio(){
+    if(!state.audioFinalUrl){
+      state.audioStatus='';
+      updateCard(id, state);
+      return;
+    }
+    // Wait for full-text watcher to finish writing the canonical mp3,
+    // then mount it (with controls, no autoplay — user already heard it).
+    let attempts=0;
+    const maxAttempts=60; // ~2 min
+    const tryMount=()=>{
+      attempts++;
+      fetch(state.audioFinalUrl,{method:'HEAD',headers:HDR}).then(r=>{
+        if(r.status===200){
+          if(state.audioListeners){
+            audio.removeEventListener('ended', state.audioListeners.ended);
+            audio.removeEventListener('error', state.audioListeners.error);
+            state.audioListeners=null;
+          }
+          audio.controls=true;
+          audio.src=state.audioFinalUrl+Q_TOKEN;
+          state.audioStatus='';
+          updateCard(id, state);
+          return;
+        }
+        if(attempts<maxAttempts){
+          state.audioStatus='Finalising audio… ('+attempts+')';
+          updateCard(id, state);
+          setTimeout(tryMount, 2000);
+        }else{
+          state.audioStatus='';
+          updateCard(id, state);
+        }
+      }).catch(()=>{
+        if(attempts<maxAttempts)setTimeout(tryMount, 2000);
+      });
+    };
+    tryMount();
+  }
+
+  const url='/audio-stream/'+encodeURIComponent(id)+Q_TOKEN;
+  const es=new EventSource(url);
+  state.audioEs=es;
+
+  es.addEventListener('part',(e)=>{
+    try{
+      const d=JSON.parse(e.data);
+      if(typeof d.url!=='string')return;
+      state.audioGotPart=true;
+      state.audioQueue.push(d.url+Q_TOKEN);
+      startNext();
+    }catch(err){/* ignore */}
+  });
+
+  es.addEventListener('skip',(e)=>{
+    // A chunk failed to synthesize. Text is still complete — full-text
+    // mp3 will cover the gap on replay. Just log it.
+    try{console.log('audio skip', JSON.parse(e.data));}catch(err){}
+  });
+
+  es.addEventListener('done',(e)=>{
+    try{
+      const d=JSON.parse(e.data);
+      if(typeof d.url==='string')state.audioFinalUrl=d.url;
+    }catch(err){/* ignore */}
+    state.audioDone=true;
+    es.close();
+    state.audioEs=null;
+    if(!state.audioGotPart){
+      // Fast task or chunk mode disabled — fall back to canonical mp3.
+      pollAudio(id);
+    }else if(!state.audioPlaying&&state.audioQueue.length===0){
+      finalizeAudio();
+    }
+    // Otherwise: finalize fires from the last chunk's `ended` callback.
+  });
+
+  es.addEventListener('fatal',(e)=>{
+    es.close();
+    state.audioEs=null;
+    if(!state.audioGotPart)pollAudio(id);
+  });
+
+  es.addEventListener('error',(e)=>{
+    if(es.readyState===EventSource.CLOSED){
+      state.audioEs=null;
+      if(!state.audioGotPart)pollAudio(id);
     }
   });
 }
@@ -1304,10 +1658,11 @@ async function send(){
     const r=await fetch('/task',{method:'POST',headers:jhdr(),body:JSON.stringify({from:'web',task:text})});
     const d=await r.json();
     if(d.ok){
-      tasks.set(d.task_id, {prompt:text, status:'working', result:'', audioStatus:'', audioEl: audio, es: null});
+      tasks.set(d.task_id, {prompt:text, status:'working', result:'', audioStatus:'', audioEl: audio, es: null, audioEs: null, audioQueue: [], audioPlaying: false, audioDone: false, audioFinalUrl: null, audioGotPart: false, audioListeners: null});
       updateCard(d.task_id, tasks.get(d.task_id));
       ta.value='';
       streamResult(d.task_id);
+      streamAudio(d.task_id);
     } else {
       try{audio.pause();}catch(e){}
       alert('Error: '+(d.error||'unknown'));

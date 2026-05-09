@@ -10,8 +10,9 @@ Phone (voice-to-text)
        └─► tasks/<id>.txt
             └─► copilot-task-runner.mjs ──► copilot -p ... --allow-all-tools
                  └─► results/<id>.txt
-                      └─► edge-tts-watcher.py ──► results/<id>.mp3
-                           └─► Browser shows text + plays audio
+                      └─► edge-tts-watcher.py ──► results/<id>.part-N.mp3 (live chunks)
+                                            └──► results/<id>.mp3       (canonical replay)
+                           └─► Browser shows text + plays audio (chunks autoplay live)
 ```
 
 You dictate a task on your phone (using its built-in voice-to-text), tap
@@ -127,9 +128,9 @@ Both your PC and phone need to be on the same Wi-Fi.
 | `src/startup.ps1` | Windows orchestrator — start/stop/restart all services |
 | `src/agent-api.py` | HTTP server (port 7843) — web form + `POST /task` endpoint |
 | `src/copilot-task-runner.mjs` | Node poller — runs Copilot CLI per task |
-| `src/edge-tts-watcher.py` | Python poller — generates MP3 from result text |
+| `src/edge-tts-watcher.py` | Python poller — generates streaming `<id>.part-N.mp3` chunks and the canonical `<id>.mp3` from result text |
 | `tasks/` | Inbox — new `<id>.txt` files trigger the runner |
-| `results/` | Outbox — `<id>.txt` (text) + `<id>.mp3` (audio) |
+| `results/` | Outbox — `<id>.txt` (text) + `<id>.mp3` (audio) + `<id>.part-N.mp3` (streamed chunks) + `<id>.parts.jsonl` (chunk manifest) |
 | `tasks/archive/YYYY-MM/` | Processed task files (kept for audit / training) |
 | `logs/` | One `.log` + `.log.err` per service |
 
@@ -156,15 +157,26 @@ Both your PC and phone need to be on the same Wi-Fi.
    `assistant.message` event is written atomically to `results/<id>.txt`
    when the process exits.
 4. The task file is moved to `tasks/archive/YYYY-MM/<id>.txt`.
-5. `edge-tts-watcher.py` sees the new `<id>.txt` once it's stable, calls
-   `edge_tts.Communicate(...).save("<id>.mp3")` (atomic write).
-6. The browser opens `EventSource('/stream/<id>')` and live-renders each
-   `event: chunk` as Copilot generates it. When the SSE `event: done`
-   arrives (final answer ready), the form polls `HEAD /media/results/<id>.mp3`
-   until it's 200, then **autoplays** the audio. Autoplay works because
-   the form pre-warms an `<audio>` element with a silent placeholder
-   inside the Send-button click handler, claiming user-activation that
-   persists until the real mp3 is set later.
+5. `edge-tts-watcher.py` runs in two complementary modes per task:
+   - **Streaming mode** — tails `<id>.partial` as it grows, splits the
+     text at sentence boundaries (and on idle/max-length timeouts), and
+     synthesises each slice into `<id>.part-<N>.mp3`. Each part is
+     atomically written and then a JSON record is appended to
+     `<id>.parts.jsonl` (the manifest the SSE endpoint streams to the
+     browser).
+   - **Full-text mode** — once `<id>.txt` is stable, synthesises the
+     canonical full-result `<id>.mp3` for replay/download.
+   The two modes write to disjoint files and run in parallel.
+6. The browser opens **two** EventSource connections per task:
+   - `/stream/<id>` — text deltas, rendered live as Copilot generates them.
+   - `/audio-stream/<id>` — audio chunks. Each `event: part` adds a part
+     URL to a queue; the warmed-up `<audio>` element plays them
+     sequentially via its `ended` event. When the manifest emits
+     `event: done`, the form HEAD-polls the canonical `<id>.mp3` and
+     mounts it (with controls) for replay/download. Autoplay survives
+     because the form pre-warms the `<audio>` element with a silent
+     placeholder inside the Send-button click handler, claiming
+     user-activation that persists across `src` swaps.
 
 ### Reliability features
 
@@ -194,7 +206,11 @@ All optional. See `.env.windows.example` for the full list.
 | `COPILOT_POLL_INTERVAL_MS` | `500` | Task poll cadence |
 | `EDGE_TTS_VOICE` | `en-US-AriaNeural` | Run `python -m edge_tts --list-voices` for the full list |
 | `EDGE_TTS_RATE` | `+0%` | E.g. `+10%` for faster speech |
-| `EDGE_TTS_MAX_CHARS` | `4000` | Result text is truncated for audio past this |
+| `EDGE_TTS_MAX_CHARS` | `4000` | Result text is truncated for audio past this. Also caps total chars spoken across streamed chunks. |
+| `EDGE_TTS_STREAM_DISABLE` | (unset) | Set to `1` to disable streaming chunks (only the canonical full-text mp3 is generated). Saves a few TTS calls per task at the cost of "audio plays after text completes" UX. |
+| `EDGE_TTS_MIN_CHUNK_CHARS` | `80` | Minimum buffered chars before flushing a streamed chunk at a sentence boundary. Lower = lower latency, choppier audio. |
+| `EDGE_TTS_MAX_CHUNK_CHARS` | `350` | Force flush after this many buffered chars even without a sentence terminator. |
+| `EDGE_TTS_IDLE_FLUSH_MS` | `1500` | If text stops streaming for this long, flush whatever complete sentences are buffered (so the user hears trailing thoughts without waiting for the next sentence). |
 
 ### Picking a different voice
 

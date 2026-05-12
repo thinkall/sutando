@@ -206,9 +206,13 @@ All optional. See `.env.windows.example` for the full list.
 | `COPILOT_BIN` | `copilot` | Path to copilot binary |
 | `COPILOT_TASK_TIMEOUT_MS` | `600000` | 10 minutes |
 | `COPILOT_POLL_INTERVAL_MS` | `500` | Task poll cadence |
-| `EDGE_TTS_VOICE` | `en-US-AriaNeural` | Run `python -m edge_tts --list-voices` for the full list |
+| `EDGE_TTS_VOICE` | `en-US-AriaNeural` | Default voice for English/Latin text. Run `python -m edge_tts --list-voices` for the full list |
+| `EDGE_TTS_VOICE_ZH` | `zh-CN-XiaoxiaoNeural` | Voice used when text contains Chinese characters. Other Chinese voices: `zh-CN-YunxiNeural` (male), `zh-CN-XiaoyiNeural`, `zh-TW-HsiaoChenNeural` (Taiwan) |
+| `EDGE_TTS_VOICE_JA` | `ja-JP-NanamiNeural` | Voice used when text contains Hiragana/Katakana |
+| `EDGE_TTS_VOICE_KO` | `ko-KR-SunHiNeural` | Voice used when text contains Hangul |
 | `EDGE_TTS_RATE` | `+0%` | E.g. `+10%` for faster speech |
 | `EDGE_TTS_MAX_CHARS` | `4000` | Result text is truncated for audio past this. Also caps total chars spoken across streamed chunks. |
+| `EDGE_TTS_FULL_MAX_ATTEMPTS` | `3` | Give up on the canonical full-text mp3 after this many failed synthesis attempts (prevents busy-loop retry on unsupported text). |
 | `EDGE_TTS_STREAM_DISABLE` | (unset) | Set to `1` to disable streaming chunks (only the canonical full-text mp3 is generated). Saves a few TTS calls per task at the cost of "audio plays after text completes" UX. |
 | `EDGE_TTS_MIN_CHUNK_CHARS` | `80` | Minimum buffered chars before flushing a streamed chunk at a sentence boundary. Lower = lower latency, choppier audio. |
 | `EDGE_TTS_MAX_CHUNK_CHARS` | `350` | Force flush after this many buffered chars even without a sentence terminator. |

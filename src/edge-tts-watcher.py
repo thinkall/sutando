@@ -44,10 +44,21 @@ Cross-platform (Windows / macOS / Linux). Requires:
     pip install edge-tts
 
 Env vars:
-    EDGE_TTS_VOICE              — voice name (default: en-US-AriaNeural)
+    EDGE_TTS_VOICE              — default voice for English/Latin text
+                                  (default: en-US-AriaNeural)
+    EDGE_TTS_VOICE_ZH           — voice for Chinese text
+                                  (default: zh-CN-XiaoxiaoNeural)
+    EDGE_TTS_VOICE_JA           — voice for Japanese text
+                                  (default: ja-JP-NanamiNeural)
+    EDGE_TTS_VOICE_KO           — voice for Korean text
+                                  (default: ko-KR-SunHiNeural)
     EDGE_TTS_RATE               — speech rate, e.g. "+10%" (default: "+0%")
     EDGE_TTS_MAX_CHARS          — truncate full-text past this AND cap
                                   total chunked chars (default: 4000)
+    EDGE_TTS_FULL_MAX_ATTEMPTS  — give up on the canonical full-text mp3
+                                  after this many failed synthesis attempts
+                                  (default: 3) — prevents busy-loop retry
+                                  when edge-tts can't render the text.
     EDGE_TTS_POLL_MS            — poll interval (default: 1000)
     EDGE_TTS_STREAM_DISABLE     — set to 1 to skip chunk mode entirely
     EDGE_TTS_MIN_CHUNK_CHARS    — min buf before flushing at sentence (default: 80)
@@ -55,6 +66,12 @@ Env vars:
     EDGE_TTS_IDLE_FLUSH_MS      — flush after no new bytes for this long
                                   even if buffer < MIN_CHUNK_CHARS but > 0
                                   and ends after a terminator (default: 1500)
+
+Voice picking is automatic: text containing CJK, Hangul, or Hiragana/
+Katakana picks the matching language voice; everything else falls back to
+the configured default. Within chunk mode, once a non-default voice is
+chosen for a task it sticks for the remaining chunks (so an embedded code
+block doesn't switch voices mid-answer).
 
 Usage:
     python src/edge-tts-watcher.py
@@ -85,9 +102,13 @@ RESULT_DIR = REPO_DIR / "results"
 LOG_DIR = REPO_DIR / "logs"
 
 VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AriaNeural")
+VOICE_ZH = os.environ.get("EDGE_TTS_VOICE_ZH", "zh-CN-XiaoxiaoNeural")
+VOICE_JA = os.environ.get("EDGE_TTS_VOICE_JA", "ja-JP-NanamiNeural")
+VOICE_KO = os.environ.get("EDGE_TTS_VOICE_KO", "ko-KR-SunHiNeural")
 RATE = os.environ.get("EDGE_TTS_RATE", "+0%")
 MAX_CHARS = int(os.environ.get("EDGE_TTS_MAX_CHARS", "4000"))
 POLL_MS = int(os.environ.get("EDGE_TTS_POLL_MS", "1000"))
+FULL_TTS_MAX_ATTEMPTS = int(os.environ.get("EDGE_TTS_FULL_MAX_ATTEMPTS", "3"))
 
 STREAM_ENABLED = os.environ.get("EDGE_TTS_STREAM_DISABLE", "").strip() not in ("1", "true", "yes")
 MIN_CHUNK_CHARS = int(os.environ.get("EDGE_TTS_MIN_CHUNK_CHARS", "80"))
@@ -103,14 +124,59 @@ def log(msg: str) -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────────
+# Language-aware voice picker
+# ────────────────────────────────────────────────────────────────────────────
+#
+# edge-tts voices are locale-specific: an English voice (en-US-AriaNeural)
+# will silently fail ("No audio was received") when handed CJK text, while
+# a Chinese voice can speak both Chinese AND embedded Latin text. So we
+# auto-detect the dominant non-Latin script and pick a matching voice.
+#
+# Priority (first match wins):
+#   1. Hangul          → Korean voice
+#   2. Hiragana/Kana   → Japanese voice (Japanese text often also has kanji
+#                        in the CJK range, but kana is the disambiguator)
+#   3. CJK ideographs  → Chinese voice
+#   4. (none of above) → configured default (typically English)
+#
+# This is simple, works for the common cases the user actually hits, and
+# never breaks pure-English audio (default voice unchanged).
+
+# Korean Hangul Syllables + Jamo
+_HANGUL_RE = re.compile(r'[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F]')
+# Japanese Hiragana + Katakana (incl. half-width and extensions)
+_KANA_RE = re.compile(r'[\u3040-\u309F\u30A0-\u30FF\u31F0-\u31FF\uFF66-\uFF9F]')
+# CJK Unified Ideographs (covers Chinese hanzi + Japanese kanji, but kana
+# check above runs first so this only fires for Chinese-only text).
+_CJK_RE = re.compile(r'[\u4E00-\u9FFF\u3400-\u4DBF]')
+
+
+def pick_voice(text: str) -> str:
+    """Return the edge-tts voice name best suited to `text`.
+
+    Falls through to the configured default voice for English/Latin text
+    (or any text we don't know how to handle)."""
+    if _HANGUL_RE.search(text):
+        return VOICE_KO
+    if _KANA_RE.search(text):
+        return VOICE_JA
+    if _CJK_RE.search(text):
+        return VOICE_ZH
+    return VOICE
+
+
+# ────────────────────────────────────────────────────────────────────────────
 # Common synthesis helper
 # ────────────────────────────────────────────────────────────────────────────
 
-async def synthesize(text: str, mp3_path: Path) -> None:
-    """Render text to MP3 via Edge-TTS. Atomic: write .tmp then rename."""
+async def synthesize(text: str, mp3_path: Path, voice: str | None = None) -> None:
+    """Render text to MP3 via Edge-TTS. Atomic: write .tmp then rename.
+    Voice defaults to whatever ``pick_voice(text)`` chooses, so callers
+    don't have to think about language detection."""
+    chosen_voice = voice or pick_voice(text)
     tmp = mp3_path.with_suffix(mp3_path.suffix + ".tmp")
     try:
-        communicate = edge_tts.Communicate(text=text, voice=VOICE, rate=RATE)
+        communicate = edge_tts.Communicate(text=text, voice=chosen_voice, rate=RATE)
         await communicate.save(str(tmp))
         os.replace(tmp, mp3_path)
     except Exception:
@@ -131,6 +197,9 @@ async def synthesize(text: str, mp3_path: Path) -> None:
 # stays the same for two consecutive polls.
 _seen: dict[str, tuple[int, float, int]] = {}
 _done_full: set[str] = set()
+# Per-file failure counter so we don't retry forever if edge-tts can't
+# synthesize the result (e.g. wrong voice for the language, network down).
+_full_attempts: dict[str, int] = {}
 
 
 def is_stable(name: str, st: os.stat_result) -> bool:
@@ -161,14 +230,21 @@ async def process_full_text(name: str) -> None:
     if len(text) > MAX_CHARS:
         log(f"truncating {name} from {len(text)} to {MAX_CHARS} chars")
         text = text[:MAX_CHARS] + " ... result truncated for audio."
-    log(f"synthesizing full {name} ({len(text)} chars, voice={VOICE})")
+    voice = pick_voice(text)
+    log(f"synthesizing full {name} ({len(text)} chars, voice={voice})")
     try:
-        await synthesize(text, mp3_path)
+        await synthesize(text, mp3_path, voice=voice)
         log(f"wrote {mp3_path.name} ({mp3_path.stat().st_size} bytes)")
         _done_full.add(name)
+        _full_attempts.pop(name, None)
     except Exception as e:
-        log(f"full-TTS failed for {name}: {e}")
-        # Don't mark done — retry on next poll.
+        attempts = _full_attempts.get(name, 0) + 1
+        _full_attempts[name] = attempts
+        if attempts >= FULL_TTS_MAX_ATTEMPTS:
+            log(f"full-TTS gave up on {name} after {attempts} attempts: {e}")
+            _done_full.add(name)
+        else:
+            log(f"full-TTS failed for {name} (attempt {attempts}/{FULL_TTS_MAX_ATTEMPTS}): {e}")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -277,7 +353,7 @@ class ChunkState:
     __slots__ = (
         "id", "offset", "seq", "buf", "decoder",
         "last_progress_ts", "consumed_chars", "spoken_chars",
-        "finalized", "saw_partial",
+        "finalized", "saw_partial", "voice",
     )
 
     def __init__(self, task_id: str) -> None:
@@ -295,6 +371,14 @@ class ChunkState:
         self.spoken_chars = 0
         self.finalized = False
         self.saw_partial = False  # turn on once we've ever seen <id>.partial
+        # Voice chosen for THIS task. None until the first non-empty chunk
+        # decides. Once a non-default voice is chosen, it sticks for the
+        # whole task — otherwise an embedded code block (all Latin) in the
+        # middle of a Chinese answer would jarringly switch to English mid-
+        # stream. Default voice is overridable by any later non-default
+        # pick (so an answer that starts in English then turns Chinese
+        # locks to Chinese for remaining chunks).
+        self.voice: str | None = None
 
 
 # id → ChunkState. Persists across poll iterations.
@@ -320,11 +404,11 @@ def append_manifest_line(task_id: str, obj: dict) -> None:
         f.flush()
 
 
-async def synthesize_chunk_with_retry(text: str, dst: Path, label: str) -> bool:
+async def synthesize_chunk_with_retry(text: str, dst: Path, label: str, voice: str | None = None) -> bool:
     """One retry on failure. Returns True iff dst was written."""
     for attempt in (1, 2):
         try:
-            await synthesize(text, dst)
+            await synthesize(text, dst, voice=voice)
             return True
         except Exception as e:
             if attempt == 1:
@@ -366,9 +450,15 @@ async def emit_chunk(s: ChunkState, text: str, is_final: bool = False) -> None:
 
     s.seq += 1
     dst = part_path(s.id, s.seq)
-    label = f"{s.id} part-{s.seq} ({len(spoken)} chars)"
+    chunk_voice = pick_voice(spoken)
+    # Lock to the first non-default voice we ever pick (or fall back to
+    # the chunk's own pick if we've never locked anything yet).
+    if s.voice is None or (chunk_voice != VOICE and s.voice == VOICE):
+        s.voice = chunk_voice
+    voice = s.voice
+    label = f"{s.id} part-{s.seq} ({len(spoken)} chars, voice={voice})"
     log(f"synthesizing {label}")
-    ok = await synthesize_chunk_with_retry(spoken, dst, label)
+    ok = await synthesize_chunk_with_retry(spoken, dst, label, voice=voice)
     s.consumed_chars += raw_len
     s.spoken_chars += len(spoken)
     if ok:

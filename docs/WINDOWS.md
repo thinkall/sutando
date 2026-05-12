@@ -160,9 +160,11 @@ Both your PC and phone need to be on the same Wi-Fi.
 5. `edge-tts-watcher.py` runs in two complementary modes per task:
    - **Streaming mode** — tails `<id>.partial` as it grows, splits the
      text at sentence boundaries (and on idle/max-length timeouts), and
-     synthesises each slice into `<id>.part-<N>.mp3`. Each part is
-     atomically written and then a JSON record is appended to
-     `<id>.parts.jsonl` (the manifest the SSE endpoint streams to the
+     synthesises each slice into `<id>.part-<N>.mp3`. Internal tool-call
+     breadcrumbs (`_[running grep…]_` etc. that you see in the live text
+     UI) are stripped before TTS, so the live audio doesn't speak them.
+     Each part is atomically written and then a JSON record is appended
+     to `<id>.parts.jsonl` (the manifest the SSE endpoint streams to the
      browser).
    - **Full-text mode** — once `<id>.txt` is stable, synthesises the
      canonical full-result `<id>.mp3` for replay/download.

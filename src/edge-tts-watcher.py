@@ -18,7 +18,12 @@ Polls `results/` every POLL_MS and produces audio in two complementary modes:
      - flush at sentence boundaries once the buffer is at least
        MIN_CHUNK_CHARS, OR after IDLE_FLUSH_MS of no new bytes (so trailing
        sentences don't sit in the buffer waiting for the next one), OR at
-       MAX_CHUNK_CHARS forced break (last whitespace).
+       MAX_CHUNK_CHARS forced break (last whitespace). Cuts back off if
+       they would split a `_[running …]_` marker.
+     - strip internal-only tool-call markers (`_[running tool…]_`) so the
+       live audio doesn't speak runner breadcrumbs that only make sense
+       in the text UI. Chunks that are 100% markers are skipped (no part
+       file, no manifest entry, no seq bump).
      - synthesize each flushed slice → `<id>.part-<N>.mp3` (atomic temp+rename)
      - one-shot retry on TTS failure; if still failing append an error line
        so the UI can show "audio gap" instead of silently dropping text.
@@ -174,52 +179,94 @@ async def process_full_text(name: str) -> None:
 # idle/finalizing). Includes ASCII + CJK terminators.
 _TERMINATOR_RE = re.compile(r'[.!?。！？\n][\s]+')
 
-# Tool-call markers from the runner look like `_[running toolname…]_`. Strip
-# the markdown emphasis underscores so edge-tts doesn't speak them as
-# "underscore". Keeps the parens for a natural pause/aside.
-_TOOL_MARKER_RE = re.compile(r'_\[(running [^\]]+)\]_')
+# Tool-call breadcrumbs from the runner look like
+#   `\n\n_[running toolname…]_\n\n`
+# (written on every `tool.execution_start` event). They're useful for the
+# live text UI ("see what tool just kicked off") but they're INTERNAL —
+# the user shouldn't hear them in the audio. We strip them entirely
+# before TTS, including the surrounding blank lines, then collapse the
+# resulting whitespace so spoken sentences don't have awkward gaps.
+_TOOL_MARKER_RE = re.compile(r'[\t ]*_\[running [^\]]+\]_[\t ]*')
 
 
-def clean_for_tts(text: str) -> str:
-    """Normalize chunk text for nicer-sounding speech."""
-    return _TOOL_MARKER_RE.sub(r'(\1)', text)
+def strip_internal(text: str) -> str:
+    """Remove markers that should NOT be spoken (tool-call breadcrumbs).
+    Returns text safe to send to edge-tts. May return an empty string if
+    the input was 100% internal."""
+    text = _TOOL_MARKER_RE.sub('', text)
+    # Collapse blank-line runs left behind by removing markers that were
+    # surrounded by `\n\n`. (Two newlines = paragraph break, anything more
+    # would be heard as an over-long pause.)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
+
+def _safe_cut(buf: str, cut: int) -> int:
+    """Don't split a tool marker `_[running …]_`. If `cut` would land
+    inside an unclosed marker, back off to just before the opening `_[`.
+
+    Returns the adjusted cut, or -1 if backing off would yield an empty
+    chunk (meaning: wait for more bytes — the marker will close shortly,
+    and a saner flush point will appear)."""
+    if cut <= 0:
+        return cut
+    last_open = buf.rfind('_[', 0, cut)
+    if last_open < 0:
+        return cut
+    close = buf.find(']_', last_open + 2)
+    if close >= 0 and close + 2 <= cut:
+        # Marker is fully within the chunk → safe to cut here.
+        return cut
+    # Cut would split the marker. Back off to just before `_[`.
+    return last_open if last_open > 0 else -1
 
 
 def find_flush_point(buf: str, idle_ms: int) -> int:
     """Return char index after which to split `buf`, or -1 if no split yet.
 
     Priority order:
-      1. MAX_CHUNK_CHARS reached → force break at last whitespace before
-         the limit (or at the limit if no whitespace).
-      2. Buffer >= MIN_CHUNK_CHARS AND a sentence terminator+whitespace
-         occurs after position MIN_CHUNK_CHARS → break right after it.
-      3. Idle for >= IDLE_FLUSH_MS, buffer non-empty, contains any
+      1. Buffer is dangerously large (MAX_CHUNK_CHARS * 3) → force break
+         even if it means splitting a tool marker. Avoids deadlock if the
+         runner emits a marker we never see closed (crash / kill).
+      2. MAX_CHUNK_CHARS reached → force break at last whitespace before
+         the limit (or at the limit if no whitespace), then back off if
+         the cut would split a marker.
+      3. Buffer >= MIN_CHUNK_CHARS AND a sentence terminator+whitespace
+         occurs after position MIN_CHUNK_CHARS → break right after it,
+         then back off for marker safety.
+      4. Idle for >= IDLE_FLUSH_MS, buffer non-empty, contains any
          terminator → break after the LAST terminator (drains complete
          sentences without forcing a too-small chunk while text is
-         actively streaming).
+         actively streaming), then back off for marker safety.
     """
     n = len(buf)
     if n == 0:
         return -1
 
-    # 1. Force break at MAX_CHUNK_CHARS
-    if n >= MAX_CHUNK_CHARS:
+    # 1. Deadlock breaker — buf grew way past max with no clean cut.
+    if n >= MAX_CHUNK_CHARS * 3:
         cut = buf.rfind(' ', max(MIN_CHUNK_CHARS, MAX_CHUNK_CHARS - 80), MAX_CHUNK_CHARS)
         return cut + 1 if cut > 0 else MAX_CHUNK_CHARS
 
-    # 2. Sentence boundary after MIN_CHUNK_CHARS
+    # 2. Force break at MAX_CHUNK_CHARS
+    if n >= MAX_CHUNK_CHARS:
+        cut = buf.rfind(' ', max(MIN_CHUNK_CHARS, MAX_CHUNK_CHARS - 80), MAX_CHUNK_CHARS)
+        cut = cut + 1 if cut > 0 else MAX_CHUNK_CHARS
+        return _safe_cut(buf, cut)
+
+    # 3. Sentence boundary after MIN_CHUNK_CHARS
     if n >= MIN_CHUNK_CHARS:
         for m in _TERMINATOR_RE.finditer(buf):
             if m.end() >= MIN_CHUNK_CHARS:
-                return m.end()
+                return _safe_cut(buf, m.end())
 
-    # 3. Idle flush — drain complete sentences even if buffer < MIN_CHUNK_CHARS
+    # 4. Idle flush — drain complete sentences even if buffer < MIN_CHUNK_CHARS
     if idle_ms >= IDLE_FLUSH_MS:
         last = -1
         for m in _TERMINATOR_RE.finditer(buf):
             last = m.end()
         if last > 0:
-            return last
+            return _safe_cut(buf, last)
 
     return -1
 
@@ -229,17 +276,23 @@ class ChunkState:
 
     __slots__ = (
         "id", "offset", "seq", "buf", "decoder",
-        "last_progress_ts", "total_chars", "finalized", "saw_partial",
+        "last_progress_ts", "consumed_chars", "spoken_chars",
+        "finalized", "saw_partial",
     )
 
     def __init__(self, task_id: str) -> None:
         self.id = task_id
         self.offset = 0  # bytes already read from <id>.partial
-        self.seq = 0  # last emitted part number
+        self.seq = 0  # last emitted part number (only bumped on actual synth)
         self.buf = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self.last_progress_ts = time.time()
-        self.total_chars = 0  # total chars emitted to TTS so far
+        # Raw chars pulled out of partial (incl. marker text). Used for
+        # reconciliation against final_text length on finalize.
+        self.consumed_chars = 0
+        # Chars actually sent to TTS (after marker strip + .strip()). Used
+        # for MAX_CHARS audio cap so internal markers don't count toward it.
+        self.spoken_chars = 0
         self.finalized = False
         self.saw_partial = False  # turn on once we've ever seen <id>.partial
 
@@ -284,36 +337,49 @@ async def synthesize_chunk_with_retry(text: str, dst: Path, label: str) -> bool:
 
 
 async def emit_chunk(s: ChunkState, text: str, is_final: bool = False) -> None:
-    """Synthesize one chunk, write part file, append manifest line. Skips
-    blank-text chunks. Enforces MAX_CHARS total cap (matches full-text mode)."""
-    text = text.strip()
-    if not text:
+    """Synthesize one chunk, write part file, append manifest line.
+
+    Strips internal-only markers (tool-call breadcrumbs) before synthesis.
+    If the chunk is 100% internal, skips synthesis entirely (no part file,
+    no manifest line, no seq bump) but still advances consumed_chars so
+    reconciliation against final_text stays accurate.
+
+    Enforces MAX_CHARS cap on SPOKEN chars only (internal markers don't
+    count, matching the user-visible audio length to the cap)."""
+    raw_len = len(text)
+    spoken = strip_internal(text).strip()
+
+    if not spoken:
+        # Chunk was 100% tool markers / blank lines. Don't synthesize, but
+        # do advance the raw consumed counter so reconciliation works.
+        s.consumed_chars += raw_len
         return
-    if s.total_chars + len(text) > MAX_CHARS:
-        # Hit the cap — truncate the chunk to fit, mark as the last one.
-        room = max(0, MAX_CHARS - s.total_chars)
+
+    if s.spoken_chars + len(spoken) > MAX_CHARS:
+        room = max(0, MAX_CHARS - s.spoken_chars)
         if room <= 0:
-            log(f"id {s.id}: total chars cap reached, skipping further chunks")
+            log(f"id {s.id}: total spoken chars cap reached, skipping further chunks")
+            s.consumed_chars += raw_len
             return
-        text = text[:room]
+        spoken = spoken[:room]
         is_final = True
 
-    spoken = clean_for_tts(text)
     s.seq += 1
     dst = part_path(s.id, s.seq)
     label = f"{s.id} part-{s.seq} ({len(spoken)} chars)"
     log(f"synthesizing {label}")
     ok = await synthesize_chunk_with_retry(spoken, dst, label)
-    s.total_chars += len(text)
+    s.consumed_chars += raw_len
+    s.spoken_chars += len(spoken)
     if ok:
         try:
             size = dst.stat().st_size
         except OSError:
             size = 0
-        append_manifest_line(s.id, {"seq": s.seq, "chars": len(text), "bytes": size})
+        append_manifest_line(s.id, {"seq": s.seq, "chars": len(spoken), "bytes": size})
         log(f"wrote {dst.name} ({size} bytes)")
     else:
-        append_manifest_line(s.id, {"seq": s.seq, "chars": len(text), "error": "tts_failed"})
+        append_manifest_line(s.id, {"seq": s.seq, "chars": len(spoken), "error": "tts_failed"})
 
 
 async def process_chunk_id(task_id: str) -> None:
@@ -354,7 +420,7 @@ async def process_chunk_id(task_id: str) -> None:
             break
         chunk_text, s.buf = s.buf[:cut], s.buf[cut:]
         await emit_chunk(s, chunk_text)
-        if s.total_chars >= MAX_CHARS:
+        if s.spoken_chars >= MAX_CHARS:
             break
 
     # 3. Finalize when <id>.txt arrives. Reconcile against final text in case
@@ -376,11 +442,15 @@ async def process_chunk_id(task_id: str) -> None:
 
         # Reconcile: if final_text is longer than what we read+buffered,
         # append the missing suffix so we speak the canonical answer.
+        # `consumed_chars` is RAW partial chars (incl. markers); final_text
+        # has no markers. So this comparison only fires when we genuinely
+        # missed a tail (rare — only when poll cadence loses to runner's
+        # final-write/partial-delete window).
         try:
             final_text = final.read_text(encoding="utf-8", errors="replace")
         except OSError:
             final_text = ""
-        consumed_chars = s.total_chars + len(s.buf)
+        consumed_chars = s.consumed_chars + len(s.buf)
         if len(final_text) > consumed_chars:
             s.buf += final_text[consumed_chars:]
 
@@ -392,7 +462,7 @@ async def process_chunk_id(task_id: str) -> None:
         final_url = f"/media/results/{task_id}.mp3"
         append_manifest_line(s.id, {"done": True, "total": s.seq, "final_url": final_url})
         s.finalized = True
-        log(f"id {task_id}: chunk stream complete ({s.seq} parts, {s.total_chars} chars)")
+        log(f"id {task_id}: chunk stream complete ({s.seq} parts, {s.spoken_chars} spoken chars, {s.consumed_chars} raw chars)")
 
 
 def discover_chunk_ids() -> set[str]:

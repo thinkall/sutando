@@ -59,6 +59,11 @@ const LOG_DIR = join(REPO_DIR, 'logs');
 
 const POLL_INTERVAL_MS = parseInt(process.env.COPILOT_POLL_INTERVAL_MS || '500', 10);
 const TASK_TIMEOUT_MS = parseInt(process.env.COPILOT_TASK_TIMEOUT_MS || '600000', 10); // 10 min
+// When Copilot itself crashes (non-zero exit / timeout) AFTER streaming at
+// least this many chars of an answer, treat the partial as a successful
+// (but truncated) result rather than burying it in an error message. The
+// user gets "most of the poem" instead of "Copilot exited with code 1".
+const PARTIAL_OK_MIN_CHARS = parseInt(process.env.COPILOT_PARTIAL_OK_MIN_CHARS || '50', 10);
 const COPILOT_BIN = process.env.COPILOT_BIN || 'copilot';
 const RUN_ONCE = process.argv.includes('--once');
 const IS_WIN = process.platform === 'win32';
@@ -124,6 +129,8 @@ function buildPrompt(absoluteTaskPath) {
 		'Keep the reply concise and conversational; it will be read aloud via text-to-speech.',
 		'If the task is a question, answer it directly.',
 		'If the task asks you to do something on the system, do it, then briefly confirm.',
+		'When the user asks you to read aloud, recite, sing, or otherwise produce a piece of text (a poem, an essay, lyrics, etc.), JUST OUTPUT THE TEXT directly as your reply — do NOT try to invoke any audio/TTS/speech tool yourself, the system handles speech synthesis automatically from your reply text.',
+		'Avoid unnecessary tool use for simple knowledge or recitation requests; just answer in plain text.',
 		'Do not include the task file metadata (id:, timestamp:, source:, from:) in your reply.',
 	].join(' ');
 }
@@ -222,6 +229,7 @@ async function runCopilot(taskId, taskFilePath, partialPath) {
 		let timedOut = false;
 		let settled = false;
 		let messageCount = 0;        // count of assistant.message events seen (for separators)
+		let sessionError = '';       // last session.error message (from copilot itself)
 
 		const closePartial = () => {
 			try { partialStream.end(); } catch { /* ignore */ }
@@ -267,6 +275,15 @@ async function runCopilot(taskId, taskFilePath, partialPath) {
 				// only the canonical finalMessage gets written to <id>.txt.
 				const name = (evt.data && (evt.data.toolName || evt.data.name)) || 'tool';
 				try { partialStream.write(`\n\n_[running ${name}…]_\n\n`); } catch { /* ignore */ }
+			} else if (t === 'session.error') {
+				// Copilot itself hit an unrecoverable error (typically the upstream
+				// model returning errors after exhausted retries). Capture the
+				// human-readable message so we can include it in the result if no
+				// final answer arrives.
+				const m = evt.data && evt.data.message;
+				if (typeof m === 'string' && m.length > 0) {
+					sessionError = m;
+				}
 			}
 		};
 
@@ -304,17 +321,42 @@ async function runCopilot(taskId, taskFilePath, partialPath) {
 			}
 			const finalText = (finalMessage || deltaAccumulator).trim();
 			if (timedOut) {
+				if (finalText.length >= PARTIAL_OK_MIN_CHARS) {
+					log(`[${taskId}] TIMEOUT but kept partial answer (${finalText.length} chars)`);
+					settle({ ok: true, text: `${finalText}\n\n(注:回答因超时被截断 / answer truncated by ${Math.round(TASK_TIMEOUT_MS / 1000)}s timeout)` });
+					return;
+				}
 				settle({ ok: false, text: `Task timed out after ${Math.round(TASK_TIMEOUT_MS / 1000)} seconds. Partial output:\n\n${finalText || '(none)'}` });
 				return;
 			}
 			if (code !== 0) {
-				const errMsg = `Copilot exited with code ${code}.\n\nSTDERR:\n${stderr.trim() || '(empty)'}\n\nPARTIAL ANSWER:\n${finalText || '(empty)'}`;
-				log(`[${taskId}] non-zero exit ${code}`);
+				// Copilot itself died (process exit non-zero). The most common
+				// cause we've observed is `session.error` from the upstream AI
+				// model returning errors after exhausted retries on long-form
+				// CJK generation (e.g. reciting a classical poem).
+				//
+				// If we already streamed a substantial chunk of an answer, prefer
+				// "broken but mostly-correct text" over "useless error message" —
+				// write the partial as the result so the user still hears most of
+				// what they asked for. Otherwise fall back to the diagnostic
+				// error message including any session.error we captured.
+				if (finalText.length >= PARTIAL_OK_MIN_CHARS) {
+					const note = sessionError
+						? `(注:模型出错,回答可能未完成 / model error, answer may be truncated: ${sessionError.split('\n')[0]})`
+						: `(注:Copilot 异常退出,回答可能未完成 / Copilot exited with code ${code}, answer may be truncated)`;
+					log(`[${taskId}] non-zero exit ${code} but kept partial answer (${finalText.length} chars)`);
+					settle({ ok: true, text: `${finalText}\n\n${note}` });
+					return;
+				}
+				const sessionErrLine = sessionError ? `\n\nMODEL ERROR:\n${sessionError}` : '';
+				const errMsg = `Copilot exited with code ${code}.${sessionErrLine}\n\nSTDERR:\n${stderr.trim() || '(empty)'}\n\nPARTIAL ANSWER:\n${finalText || '(empty)'}`;
+				log(`[${taskId}] non-zero exit ${code}${sessionError ? ' (session.error)' : ''}`);
 				settle({ ok: false, text: errMsg });
 				return;
 			}
 			if (!finalText) {
-				settle({ ok: false, text: `Copilot produced no answer. STDERR: ${stderr.trim() || '(none)'}` });
+				const sessionErrLine = sessionError ? ` MODEL ERROR: ${sessionError}` : '';
+				settle({ ok: false, text: `Copilot produced no answer.${sessionErrLine} STDERR: ${stderr.trim() || '(none)'}` });
 				return;
 			}
 			log(`[${taskId}] streamed ${messageCount} message(s), finalised ${finalText.length} chars`);

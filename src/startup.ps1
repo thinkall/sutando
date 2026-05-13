@@ -115,6 +115,8 @@ function Start-Service {
             EDGE_TTS_VOICE = $env:EDGE_TTS_VOICE
             EDGE_TTS_RATE = $env:EDGE_TTS_RATE
             EDGE_TTS_MAX_CHARS = $env:EDGE_TTS_MAX_CHARS
+            SUTANDO_NOTIFY = $env:SUTANDO_NOTIFY
+            SUTANDO_MEMORY_HINTS = $env:SUTANDO_MEMORY_HINTS
             PYTHONIOENCODING = 'utf-8'
         }
         foreach ($k in $Env.Keys) { $envForward[$k] = [string]$Env[$k] }

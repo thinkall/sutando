@@ -111,18 +111,125 @@ voice_desired_state = "disconnected"
 
 
 
-def get_status() -> dict:
+PID_DIR = REPO_DIR / "state"
+WINDOWS_SERVICES = ("agent-api", "task-runner", "tts-watcher")
+
+
+def _read_pid(name: str) -> int | None:
+    """Read PID from state/<name>.pid (written by startup.ps1)."""
+    pid_file = PID_DIR / f"{name}.pid"
+    if not pid_file.exists():
+        return None
     try:
-        # Use sys.executable — under launchd, bare `python3` resolves to
-        # /usr/bin/python3 (3.9) which can't parse health-check.py's 3.10+
-        # union syntax. Same regression source as dashboard.get_health().
-        result = subprocess.run(
-            [sys.executable, str(REPO_DIR / "src/health-check.py"), "--json"],
-            capture_output=True, text=True, timeout=15,
-        )
-        health = json.loads(result.stdout.strip())
+        return int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Cross-platform liveness check. Uses tasklist on Windows (no psutil
+    dep), os.kill(pid, 0) on POSIX."""
+    if not pid or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            # tasklist prints "INFO: No tasks..." to stdout when not found.
+            return f'"{pid}"' in out.stdout
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _check_service(name: str) -> dict:
+    pid = _read_pid(name)
+    if pid is None:
+        return {"name": name, "status": "stopped", "pid": None, "alive": False}
+    alive = _is_pid_alive(pid)
+    return {
+        "name": name,
+        "status": "running" if alive else "dead",
+        "pid": pid,
+        "alive": alive,
+    }
+
+
+def _tool_version(args: list[str]) -> str | None:
+    """Return first stripped line of `tool --version`, or None on failure."""
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        text = (out.stdout or out.stderr or "").strip().splitlines()
+        return text[0] if text else None
     except Exception:
-        health = {"error": "health check unavailable"}
+        return None
+
+
+def get_status() -> dict:
+    """Windows-friendly health check — replaces the macOS-only call to
+    src/health-check.py. Reports per-service liveness (PIDs from state/),
+    queue counts, and tool versions."""
+    services = [_check_service(name) for name in WINDOWS_SERVICES]
+
+    pending_tasks = 0
+    pending_results = 0
+    archived_results = 0
+    try:
+        pending_tasks = sum(1 for _ in TASK_DIR.glob("*.txt"))
+    except Exception:
+        pass
+    try:
+        pending_results = sum(1 for _ in RESULT_DIR.glob("task-*.txt"))
+    except Exception:
+        pass
+    try:
+        archive_root = RESULT_DIR / "archive"
+        if archive_root.exists():
+            archived_results = sum(
+                1 for _ in archive_root.rglob("task-*.txt")
+            )
+    except Exception:
+        pass
+
+    # All services alive → ok; any dead but tracked → degraded; none tracked → unknown.
+    if all(s["alive"] for s in services):
+        overall = "ok"
+    elif any(s["alive"] for s in services):
+        overall = "degraded"
+    else:
+        overall = "down"
+
+    health = {
+        "overall": overall,
+        "services": services,
+        "queues": {
+            "tasks_pending": pending_tasks,
+            "results_unarchived": pending_results,
+            "results_archived": archived_results,
+        },
+        "tools": {
+            "node": _tool_version(["node", "--version"]),
+            "python": _tool_version([sys.executable, "--version"]),
+            "copilot": _tool_version([
+                os.environ.get("COPILOT_BIN", "copilot"), "--version"
+            ]),
+        },
+        "directories": {
+            "tasks": TASK_DIR.exists(),
+            "results": RESULT_DIR.exists(),
+            "logs": (REPO_DIR / "logs").exists(),
+            "state": PID_DIR.exists(),
+            "memory": (REPO_DIR / "memory").exists(),
+            "notes": (REPO_DIR / "notes").exists(),
+        },
+        "platform": sys.platform,
+    }
 
     return {
         "agent": "sutando",
@@ -130,14 +237,18 @@ def get_status() -> dict:
         "status": "running",
         "health": health,
         "capabilities": [
-            "research", "email", "calendar", "reminders", "screen-capture",
-            "browser-automation", "notes", "file-management", "code",
-            "image-generation", "translation", "contacts",
+            "task-bridge", "streaming-text", "streaming-audio",
+            "edge-tts", "memory", "notes", "browser-automation",
         ],
         "endpoints": {
             "task": "POST /task",
+            "result": "GET /result/<id>",
+            "stream": "GET /stream/<id>",
+            "audio_stream": "GET /audio-stream/<id>",
             "status": "GET /status",
             "ping": "GET /ping",
+            "tasks_active": "GET /tasks/active",
+            "answer": "POST /answer",
         },
     }
 
@@ -314,9 +425,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # /result/<id>. (No-op when token unset → preserves Mac default.)
             if not self.check_auth():
                 return
-            # List active tasks + system status for the web client
-            watcher_ok = subprocess.run(["pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
-            claude_ok = subprocess.run(["pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
+            # List active tasks + system status for the web client.
+            # Cross-platform: use the PID files written by startup.ps1
+            # (Windows) or startup.sh (Mac) instead of pgrep, which only
+            # exists on POSIX. `watcher_ok` and `claude_ok` keep their
+            # original semantics so the Mac UI shape isn't broken — on
+            # Windows they map to the task-runner and tts-watcher procs
+            # we actually have (no Claude session here).
+            if sys.platform == "win32":
+                watcher_ok = _check_service("task-runner")["alive"]
+                claude_ok = _check_service("tts-watcher")["alive"]
+            else:
+                watcher_ok = subprocess.run(["pgrep", "-f", "watch-tasks"], capture_output=True).returncode == 0
+                claude_ok = subprocess.run(["pgrep", "-f", "claude.*sutando-core"], capture_output=True).returncode == 0
             # Scan disk for active tasks, update history (preserve existing text)
             for f in sorted(TASK_DIR.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 task_id = f.stem
@@ -410,6 +531,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
                     questions.append(q)
             self.send_json(200, {"tasks": tasks, "watcher": watcher_ok, "claude": claude_ok, "questions": questions})
+        elif path == "/pending-questions":
+            # Standalone listing of unanswered pending questions. Same
+            # parsing as the /tasks/active branch above, but exposed as
+            # its own endpoint so the web UI can poll it independently
+            # at a slower cadence (questions don't change as often as
+            # the active-task list). Auth-gated since pending-questions.md
+            # may contain sensitive prompts.
+            if not self.check_auth():
+                return
+            questions = []
+            pq_file = Path(personal_path("pending-questions.md", REPO_DIR))
+            if pq_file.exists():
+                content = pq_file.read_text(encoding="utf-8")
+                for i, section in enumerate(re.split(r'^## ', content, flags=re.MULTILINE)):
+                    if not section.strip():
+                        continue
+                    lines = section.strip().split('\n')
+                    title = lines[0].strip()
+                    body = '\n'.join(lines[1:])
+                    if '**Status:**' not in body and '**Options:**' not in body:
+                        continue
+                    if re.search(r'\*\*Status:\*\*\s*(resolved|answered|done|complete)', body, re.IGNORECASE):
+                        continue
+                    q_text = re.split(r'\*\*(?:Status|Options|Asked|Question):\*\*', body)[0].strip()
+                    q = {"id": f"Q{i}", "text": title, "detail": q_text or title}
+                    opts_match = re.search(r'\*\*Options:\*\*\s*(.+)', body)
+                    if opts_match:
+                        q["options"] = [o.strip() for o in opts_match.group(1).split("|")]
+                    questions.append(q)
+            self.send_json(200, {"questions": questions})
+        elif path == "/history":
+            # Recent task history (most-recent first). Scans disk directly
+            # so it works without depending on /tasks/active being called
+            # first to populate task_history. Looks at three sources:
+            # results/task-*.txt (recent), results/archive/*/task-*.txt
+            # (older), and the in-memory task_history dict (covers tasks
+            # whose result files were already cleaned up). Capped at 25.
+            # Auth-gated because result text may contain sensitive content.
+            if not self.check_auth():
+                return
+            history_map = {}
+            try:
+                for f in RESULT_DIR.glob("task-*.txt"):
+                    try:
+                        text = f.read_text(encoding="utf-8", errors="replace").strip()
+                        history_map[f.stem] = {
+                            "id": f.stem,
+                            "status": "done",
+                            "time": f.stat().st_mtime,
+                            "text": text.split("\n", 1)[0][:120] if text else f.stem,
+                            "preview": text[:400],
+                        }
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            try:
+                archive_root = RESULT_DIR / "archive"
+                if archive_root.exists():
+                    for f in archive_root.rglob("task-*.txt"):
+                        if f.stem in history_map:
+                            continue
+                        try:
+                            text = f.read_text(encoding="utf-8", errors="replace").strip()
+                            history_map[f.stem] = {
+                                "id": f.stem,
+                                "status": "done",
+                                "time": f.stat().st_mtime,
+                                "text": text.split("\n", 1)[0][:120] if text else f.stem,
+                                "preview": text[:400],
+                            }
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            # Merge in-memory entries last so any working-state tasks not
+            # yet on disk also appear.
+            for tid, tdata in task_history.items():
+                if tid in history_map and history_map[tid]["status"] == "done":
+                    continue
+                history_map[tid] = {
+                    "id": tid,
+                    "status": tdata.get("status", ""),
+                    "time": tdata.get("time", 0),
+                    "text": tdata.get("text", ""),
+                    "preview": (tdata.get("result", "") or "")[:400],
+                }
+            history = sorted(
+                history_map.values(),
+                key=lambda x: x.get("time", 0),
+                reverse=True,
+            )[:25]
+            self.send_json(200, {"history": history})
         elif path.startswith("/result/"):
             # Auth-gate result text — when SUTANDO_API_TOKEN is set, we don't
             # want anyone on the LAN to be able to read prior results just
@@ -1007,24 +1221,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         global voice_desired_state
         path = urlparse(self.path).path
 
-        # Twilio webhook endpoints (no auth — Twilio signs requests)
+        # Twilio webhook endpoints — UNSUPPORTED in the Windows + Copilot
+        # CLI port. The macOS Sutando uses Twilio for inbound phone calls
+        # and SMS-to-task; that path requires a Twilio account, public
+        # ngrok URL, and the voice-agent (Gemini) which we deliberately
+        # excluded. Returning 501 (rather than 404 or silently deleting
+        # the routes) keeps the original API surface visible and gives a
+        # clear hint to anyone copying macOS examples.
         if path.startswith("/twilio/"):
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode()
-            if not validate_twilio_signature(self, body):
-                self.send_json(403, {"error": "invalid Twilio signature"})
-                return
-            from urllib.parse import parse_qs
-            form_data = parse_qs(body)
-
-            if path == "/twilio/voice":
-                self.handle_twilio_voice(form_data)
-            elif path == "/twilio/sms":
-                self.handle_twilio_sms(form_data)
-            elif path == "/twilio/transcription":
-                self.handle_twilio_transcription(form_data)
-            else:
-                self.send_json(404, {"error": "not found"})
+            self.send_json(501, {
+                "error": "twilio not supported",
+                "detail": "Twilio voice/SMS handlers are macOS-only and depend on the Gemini voice agent, which is excluded from the Windows + GitHub Copilot CLI port. Use the web form at / to submit tasks instead.",
+            })
             return
 
         if path == "/voice/toggle":
@@ -1213,6 +1421,25 @@ button:disabled{opacity:.5;cursor:not-allowed}
 .task-audio audio{width:100%;height:36px}
 .audio-status{font-size:11px;color:#6a6a85;margin-top:6px}
 a{color:#4ecca3}
+details{margin-top:18px;border:1px solid #1e1e30;border-radius:8px;background:#0d0d18}
+details summary{cursor:pointer;padding:10px 12px;font-size:13px;color:#a8a8c0;font-weight:600;list-style:none;display:flex;justify-content:space-between;align-items:center}
+details summary::-webkit-details-marker{display:none}
+details summary::after{content:'▾';color:#6a6a85;font-size:11px}
+details[open] summary::after{content:'▴'}
+details > .panel{padding:0 12px 12px}
+.empty{font-size:12px;color:#6a6a85;font-style:italic;padding:8px 0}
+.q-item,.h-item{border-top:1px solid #1e1e30;padding:10px 0}
+.q-item:first-child,.h-item:first-child{border-top:none}
+.q-title{font-size:13px;color:#e8e8e8;margin-bottom:6px;white-space:pre-wrap;word-break:break-word}
+.q-detail{font-size:12px;color:#a8a8c0;margin-bottom:8px;white-space:pre-wrap;word-break:break-word}
+.q-actions{display:flex;gap:6px;flex-wrap:wrap}
+.q-actions input{flex:1;min-width:140px;background:#0a0a12;border:1px solid #1e1e30;border-radius:6px;padding:6px 8px;color:#e8e8e8;font-size:12px;font-family:inherit}
+.q-actions button{flex:0 0 auto;width:auto;padding:6px 12px;font-size:12px}
+.q-opt{background:#1a2e24;color:#4ecca3;border:1px solid #2a4a36;border-radius:6px;padding:4px 10px;font-size:11px;cursor:pointer;font-family:inherit}
+.q-opt:hover{background:#243e30}
+.h-head{display:flex;justify-content:space-between;font-size:11px;color:#6a6a85;margin-bottom:4px}
+.h-text{font-size:13px;color:#e8e8e8;margin-bottom:4px;white-space:pre-wrap;word-break:break-word}
+.h-preview{font-size:12px;color:#a8a8c0;white-space:pre-wrap;word-break:break-word;max-height:6em;overflow:hidden;position:relative}
 </style></head><body>
 <div class="card">
 <div class="header">
@@ -1223,6 +1450,14 @@ a{color:#4ecca3}
 <textarea id="task" placeholder="What do you need? (Tap mic on your phone keyboard to dictate.)"></textarea>
 <button id="send" onclick="send()">Send Task</button>
 <div class="task-list" id="task-list"></div>
+<details id="pq-panel">
+<summary><span>Pending questions <span id="pq-count" style="color:#e8b554"></span></span></summary>
+<div class="panel" id="pq-body"><div class="empty">Loading…</div></div>
+</details>
+<details id="h-panel">
+<summary><span>Recent tasks <span id="h-count" style="color:#6a6a85"></span></span></summary>
+<div class="panel" id="h-body"><div class="empty">Loading…</div></div>
+</details>
 </div>
 <script>
 // Token-from-URL: when the agent-api binds to LAN it requires
@@ -1679,6 +1914,113 @@ async function send(){
 document.getElementById('task').addEventListener('keydown', e=>{
   if((e.ctrlKey||e.metaKey)&&e.key==='Enter')send();
 });
+
+// --- Pending questions + history panels ---------------------------------
+//
+// Both load via auth-gated GET endpoints (/pending-questions, /history)
+// and re-render their contents in place. Refreshed every 30s while the
+// page is visible — no polling when the tab is in the background. The
+// pending-questions panel auto-opens if there's at least one unanswered
+// question so the user notices.
+
+function escapeText(s){
+  const d=document.createElement('div');
+  d.textContent=s;
+  return d.innerHTML;
+}
+
+function fmtTime(epoch){
+  if(!epoch)return '';
+  try{
+    const d=new Date(epoch*1000);
+    return d.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'});
+  }catch(e){return '';}
+}
+
+let lastPqIds = '';
+async function loadPendingQuestions(){
+  try{
+    const r = await fetch('/pending-questions', {headers: HDR});
+    if(!r.ok) return;
+    const data = await r.json();
+    const body = document.getElementById('pq-body');
+    const count = document.getElementById('pq-count');
+    const panel = document.getElementById('pq-panel');
+    const qs = data.questions || [];
+    count.textContent = qs.length ? '(' + qs.length + ')' : '';
+    if(!qs.length){
+      body.innerHTML = '<div class="empty">No pending questions.</div>';
+      lastPqIds = '';
+      return;
+    }
+    // Auto-open the panel the first time a new question appears.
+    const ids = qs.map(q=>q.id).join(',');
+    if(ids !== lastPqIds){
+      panel.open = true;
+      lastPqIds = ids;
+    }
+    body.innerHTML = qs.map(q => {
+      const opts = (q.options||[]).map(o =>
+        '<button class="q-opt" onclick="answerQuestion(\\'' + q.id + '\\', this.textContent)">' +
+        escapeText(o) + '</button>'
+      ).join(' ');
+      return '<div class="q-item">' +
+        '<div class="q-title">' + escapeText(q.text) + '</div>' +
+        (q.detail && q.detail !== q.text ? '<div class="q-detail">' + escapeText(q.detail) + '</div>' : '') +
+        '<div class="q-actions">' +
+          '<input type="text" placeholder="Type answer…" id="pq-in-' + q.id + '" ' +
+            'onkeydown="if(event.key===\\'Enter\\'){answerQuestion(\\'' + q.id + '\\', this.value);this.value=\\'\\';}">' +
+          '<button onclick="const i=document.getElementById(\\'pq-in-' + q.id + '\\');answerQuestion(\\'' + q.id + '\\', i.value);i.value=\\'\\';">Send</button>' +
+        '</div>' +
+        (opts ? '<div class="q-actions" style="margin-top:6px">' + opts + '</div>' : '') +
+        '</div>';
+    }).join('');
+  }catch(e){ /* swallow — panel just won't refresh */ }
+}
+
+async function answerQuestion(id, answer){
+  if(!answer || !answer.trim()) return;
+  try{
+    await fetch('/answer', {method:'POST', headers:jhdr(), body:JSON.stringify({id, answer:answer.trim()})});
+    loadPendingQuestions();
+  }catch(e){
+    alert('Failed to send answer: ' + e.message);
+  }
+}
+
+async function loadHistory(){
+  try{
+    const r = await fetch('/history', {headers: HDR});
+    if(!r.ok) return;
+    const data = await r.json();
+    const body = document.getElementById('h-body');
+    const count = document.getElementById('h-count');
+    const items = data.history || [];
+    count.textContent = items.length ? '(' + items.length + ')' : '';
+    if(!items.length){
+      body.innerHTML = '<div class="empty">No tasks yet.</div>';
+      return;
+    }
+    body.innerHTML = items.map(h =>
+      '<div class="h-item">' +
+        '<div class="h-head"><span>' + escapeText(h.id) + '</span><span>' +
+          escapeText(h.status) + ' · ' + fmtTime(h.time) + '</span></div>' +
+        (h.text ? '<div class="h-text">' + escapeText(h.text) + '</div>' : '') +
+        (h.preview ? '<div class="h-preview">' + escapeText(h.preview) + '</div>' : '') +
+      '</div>'
+    ).join('');
+  }catch(e){ /* swallow */ }
+}
+
+function refreshPanels(){
+  if(document.hidden) return;
+  loadPendingQuestions();
+  loadHistory();
+}
+refreshPanels();
+setInterval(refreshPanels, 30000);
+document.addEventListener('visibilitychange', () => { if(!document.hidden) refreshPanels(); });
+
 </script></body></html>"""
 
 

@@ -15,6 +15,8 @@
 
 import { chromium } from 'playwright';
 import { mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const url = process.argv[2];
 if (!url) {
@@ -23,7 +25,9 @@ if (!url) {
 }
 
 const actions = process.argv.slice(3);
-const SCREENSHOT_DIR = '/tmp/sutando-screenshots';
+// Cross-platform temp dir — was hard-coded /tmp/sutando-screenshots
+// (POSIX-only). On Windows, tmpdir() resolves to %LOCALAPPDATA%\Temp.
+const SCREENSHOT_DIR = join(tmpdir(), 'sutando-screenshots');
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 const browser = await chromium.launch({
@@ -42,11 +46,11 @@ try {
   } else {
     for (const action of actions) {
       if (action === 'screenshot') {
-        const path = `${SCREENSHOT_DIR}/browser-${Date.now()}.png`;
+        const path = join(SCREENSHOT_DIR, `browser-${Date.now()}.png`);
         await page.screenshot({ path, fullPage: true });
         console.log(path);
       } else if (action === 'pdf') {
-        const path = `${SCREENSHOT_DIR}/page-${Date.now()}.pdf`;
+        const path = join(SCREENSHOT_DIR, `page-${Date.now()}.pdf`);
         await page.pdf({ path, format: 'A4' });
         console.log(path);
       } else if (action === 'text') {

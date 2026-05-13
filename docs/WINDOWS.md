@@ -217,6 +217,8 @@ All optional. See `.env.windows.example` for the full list.
 | `EDGE_TTS_MIN_CHUNK_CHARS` | `80` | Minimum buffered chars before flushing a streamed chunk at a sentence boundary. Lower = lower latency, choppier audio. |
 | `EDGE_TTS_MAX_CHUNK_CHARS` | `350` | Force flush after this many buffered chars even without a sentence terminator. |
 | `EDGE_TTS_IDLE_FLUSH_MS` | `1500` | If text stops streaming for this long, flush whatever complete sentences are buffered (so the user hears trailing thoughts without waiting for the next sentence). |
+| `SUTANDO_NOTIFY` | (unset) | Set to `1` to show a Windows balloon toast each time a task finishes. Uses `src/notify.ps1` (System.Windows.Forms NotifyIcon — no module install needed). Only fires in interactive desktop sessions. |
+| `SUTANDO_MEMORY_HINTS` | (unset) | Set to `0` to suppress the runner's `memory/` and `notes/` instructions in the wrapper prompt. By default the hints are added when the directories exist. |
 
 ### Picking a different voice
 
@@ -225,6 +227,86 @@ python -m edge_tts --list-voices | Select-String "Neural"
 # pick one, e.g. en-GB-SoniaNeural, then in .env:
 # EDGE_TTS_VOICE=en-GB-SoniaNeural
 ```
+
+---
+
+## HTTP API
+
+The agent-api exposes a small JSON HTTP API on port 7843. All endpoints
+except `/ping` and `/` (the web form) require `SUTANDO_API_TOKEN` when
+the server is bound to a non-loopback interface — pass it as
+`Authorization: Bearer <tok>` or `?token=<tok>`.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/ping` | `{"pong": true}` — no auth, liveness probe |
+| GET | `/status` | Service health, queue depths, tool versions, capability list |
+| GET | `/` | The web form HTML |
+| POST | `/task` | Body `{"task": "<text>", "from": "web"}` → `{"task_id": "..."}` |
+| GET | `/result/<id>` | Final result text (404 until done) |
+| GET | `/stream/<id>` | Server-Sent Events with token deltas |
+| GET | `/audio-stream/<id>` | Server-Sent Events with audio-chunk URLs |
+| GET | `/history` | Most recent 25 task results, newest first |
+| GET | `/pending-questions` | Unanswered questions parsed from `pending-questions.md` |
+| POST | `/answer` | Body `{"id": "Q<n>", "answer": "<text>"}` to mark a question answered |
+| GET | `/tasks/active` | Live + recent task list (used by the form) |
+| GET | `/media/<repo-relative-path>` | Auth-gated static file server (audio, screenshots, etc.) |
+| POST | `/twilio/*` | `501 Not Implemented` (macOS-only feature) |
+
+`/status` is the right place to look first when something seems off — it
+tells you which of the three services are alive (with PIDs from `state/`),
+how many tasks are waiting, and which tool versions you have:
+
+```powershell
+curl.exe http://localhost:7843/status | ConvertFrom-Json | Format-List
+```
+
+---
+
+## Optional capabilities
+
+These are off by default. Enable them only if you want them.
+
+### Memory / notes (`memory/`, `notes/`)
+
+The runner adds a short instruction to its wrapper prompt telling Copilot
+that personal context lives in `memory/MEMORY.md` and `memory/user_profile.md`,
+and that durable preferences should be saved there. Notes ("save this for
+later" / "remember this") go into `notes/<kebab-case>.md` with YAML
+frontmatter.
+
+The hints are added only when the directories exist, so this is opt-in by
+just creating the dirs (already done on first install). Set
+`SUTANDO_MEMORY_HINTS=0` in `.env` to suppress them entirely.
+
+> ⚠️ This is **prompt-guided file context, not automatic memory**. Whether
+> Copilot actually reads or updates the files on a given task depends on
+> Copilot deciding the task is relevant — it isn't a database. Treat the
+> files as living docs you can also edit by hand.
+
+### Toast notifications (`SUTANDO_NOTIFY=1`)
+
+Set `SUTANDO_NOTIFY=1` in `.env` and restart. Each completed task fires a
+Windows balloon via `src/notify.ps1` (built-in `System.Windows.Forms.NotifyIcon`
+— no module install). Notifications only show in interactive desktop
+sessions; failures are silent so they can't break the runner.
+
+### Browser automation (`src/browser.mjs`)
+
+A thin Playwright wrapper for one-shot page reads, screenshots, clicks,
+form fills, and PDF dumps. Useful when you ask Sutando to "screenshot
+example.com" or "fill in this form".
+
+Install Playwright + a browser once:
+
+```powershell
+npm install playwright
+npx playwright install chromium
+```
+
+Then it's just `node src/browser.mjs <url> [actions...]`. Screenshots
+land in `%LOCALAPPDATA%\Temp\sutando-screenshots\`. Startup does **not**
+depend on Playwright — the package is optional.
 
 ---
 
@@ -308,14 +390,19 @@ above.
 
 ## What's NOT included on Windows
 
-This Windows port covers the **core text-task loop** only. Mac-specific
-features that the upstream README documents are not wired up here:
+This Windows port covers the **core text-task loop** plus a small set of
+ancillary features (status, history, pending questions, optional toast
+notifications, optional browser automation). Mac-specific features that
+the upstream README documents are not wired up here:
 
 - Voice agent (Gemini Live, real-time browser voice)
-- Phone calls (Twilio + ngrok)
+- Phone calls (Twilio + ngrok) — the `/twilio/*` endpoints return `501 Not Implemented`
 - Meeting join (Zoom / Google Meet)
 - macOS-only skills (Reminders, iMessage, contacts via Contacts.app, etc.)
 - Sutando.app menu-bar app (Swift/Cocoa)
+- Telegram / Discord bridges (the Python sources exist in `src/` but are
+  not started by `startup.ps1` — they need bot tokens and have not been
+  validated on Windows; treat them as "future work")
 
 Most skills under `skills/` won't run on Windows without modification.
 The Windows path uses Copilot CLI's built-in capabilities (file edit,

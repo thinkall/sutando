@@ -29,6 +29,7 @@ ACTIVITY.md
 build_log.md
 notes/*
 !notes/.gitkeep
+!notes/README.md
 
 telegram-inbox/
 discord-inbox/

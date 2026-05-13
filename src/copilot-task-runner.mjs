@@ -68,6 +68,45 @@ const COPILOT_BIN = process.env.COPILOT_BIN || 'copilot';
 const RUN_ONCE = process.argv.includes('--once');
 const IS_WIN = process.platform === 'win32';
 
+// Optional persistence directories. We mention them in the wrapper prompt
+// only when they actually exist so the prompt stays a no-op for users who
+// haven't opted into the memory/notes convention. Set
+// SUTANDO_MEMORY_HINTS=0 to suppress even when the dirs exist.
+const MEMORY_DIR = join(REPO_DIR, 'memory');
+const NOTES_DIR = join(REPO_DIR, 'notes');
+const HINTS_DISABLED = process.env.SUTANDO_MEMORY_HINTS === '0';
+
+// Windows toast notifications — opt-in via SUTANDO_NOTIFY=1. Fire
+// src/notify.ps1 in the background when each task finishes so the user
+// gets a balloon instead of having to look at the web form. Only enabled
+// on Windows since notify.ps1 uses System.Windows.Forms NotifyIcon.
+const NOTIFY_ENABLED = IS_WIN && process.env.SUTANDO_NOTIFY === '1';
+const NOTIFY_SCRIPT = join(REPO_DIR, 'src', 'notify.ps1');
+
+function notifyDone(taskId, ok, snippet) {
+	if (!NOTIFY_ENABLED) return;
+	try {
+		const title = ok ? 'Sutando — done' : 'Sutando — failed';
+		// Trim to keep the balloon body short (Windows truncates anyway).
+		const body = (snippet || taskId).replace(/\s+/g, ' ').trim().slice(0, 200);
+		spawn('powershell.exe', [
+			'-NoProfile',
+			'-ExecutionPolicy', 'Bypass',
+			'-File', NOTIFY_SCRIPT,
+			'-Title', title,
+			'-Message', body,
+			'-Icon', ok ? 'Info' : 'Warning',
+		], {
+			detached: true,
+			stdio: 'ignore',
+			windowsHide: true,
+		}).unref();
+	} catch (err) {
+		// Fail soft — never let a notification failure break task processing.
+		log(`notify failed for ${taskId}: ${err.message || err}`);
+	}
+}
+
 mkdirSync(TASK_DIR, { recursive: true });
 mkdirSync(RESULT_DIR, { recursive: true });
 mkdirSync(LOG_DIR, { recursive: true });
@@ -122,7 +161,7 @@ function archiveTask(filename) {
  * (including any in-band system instructions) is read by Copilot via its
  * Read tool from disk, not passed through CLI args. */
 function buildPrompt(absoluteTaskPath) {
-	return [
+	const lines = [
 		'You are Sutando, a personal AI assistant running locally for the user.',
 		`The user submitted a task. Read the task file at ${absoluteTaskPath} for the full content.`,
 		'Process the task. Reply with ONLY the answer text — no preamble like "Sure!" or "Here is".',
@@ -132,7 +171,25 @@ function buildPrompt(absoluteTaskPath) {
 		'When the user asks you to read aloud, recite, sing, or otherwise produce a piece of text (a poem, an essay, lyrics, etc.), JUST OUTPUT THE TEXT directly as your reply — do NOT try to invoke any audio/TTS/speech tool yourself, the system handles speech synthesis automatically from your reply text.',
 		'Avoid unnecessary tool use for simple knowledge or recitation requests; just answer in plain text.',
 		'Do not include the task file metadata (id:, timestamp:, source:, from:) in your reply.',
-	].join(' ');
+	];
+	// Memory & notes hints — additive, opt-in by directory existence so
+	// the prompt is a no-op for users who don't use the convention. The
+	// instructions are deliberately conservative ("read if relevant",
+	// "update only on durable preferences") to avoid Copilot creating
+	// noise files on every task.
+	if (!HINTS_DISABLED) {
+		if (existsSync(MEMORY_DIR)) {
+			lines.push(
+				`Persistent context lives in ${MEMORY_DIR}. Before answering, if the task is personal or open-ended, briefly read ${join(MEMORY_DIR, 'MEMORY.md')} (an index of memory files) and ${join(MEMORY_DIR, 'user_profile.md')} for stable user preferences. Do NOT dump memory content into the reply — use it silently. Update memory files only when the user explicitly teaches a durable fact (e.g. "remember that I …", "I always …").`,
+			);
+		}
+		if (existsSync(NOTES_DIR)) {
+			lines.push(
+				`Notes (the user's "second brain") live in ${NOTES_DIR}. When the user says "remember this", "take a note", or asks you to save a research summary, write a new file ${NOTES_DIR}\\<kebab-case-slug>.md with YAML frontmatter (title, date, tags) followed by the content. To recall, search the directory.`,
+			);
+		}
+	}
+	return lines.join(' ');
 }
 
 /** Resolve the Copilot CLI invocation on Windows. There can be multiple
@@ -381,11 +438,13 @@ async function processTask(filename) {
 		// is present. Order matters for the streaming UI's done event.
 		atomicWrite(resultPath, text);
 		log(`[${taskId}] result written (${text.length} chars, ${ok ? 'ok' : 'FAILED'})`);
+		notifyDone(taskId, ok, text);
 	} catch (err) {
 		log(`[${taskId}] processTask error: ${err.stack || err}`);
 		try {
 			atomicWrite(join(RESULT_DIR, filename), `Internal error: ${err.message || err}`);
 		} catch { /* ignore */ }
+		notifyDone(taskId, false, `Internal error: ${err.message || err}`);
 	} finally {
 		try { unlinkSync(partialPath); } catch { /* ignore */ }
 		archiveTask(filename);

@@ -11,6 +11,7 @@
 import { createServer } from 'node:http';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { readTmuxStatus } from './tmux-status.js';
+import { CHAT_HTML } from './chat-ui.js';
 
 const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
@@ -247,7 +248,7 @@ const HTML = /* html */ `<!DOCTYPE html>
 
   /* Conversation */
   #transcript {
-    min-height: 80px; max-height: 30vh;
+    min-height: 80px; max-height: 50vh;
     background: #0e0e18; border-radius: 12px; padding: 10px 14px;
     overflow-y: auto; font-size: 16px; line-height: 1.6;
     margin-bottom: 6px;
@@ -524,7 +525,34 @@ const HTML = /* html */ `<!DOCTYPE html>
   .toast .toast-label { color: #4ecca3; font-weight: 600; }
   @keyframes toastIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateY(-8px); } }
+
+  /* Markdown styles inside .t-assistant — when the bridge result contains
+     headings/lists/code, render it instead of showing raw # ## etc. The
+     bubble already has a colored prefix ("Sutando: ") via .t-assistant::before. */
+  .t-assistant h1, .t-assistant h2, .t-assistant h3, .t-assistant h4 { color: #e8e8ee; font-weight: 700; margin: 0.5em 0 0.3em; }
+  .t-assistant h1 { font-size: 1.3em; }
+  .t-assistant h2 { font-size: 1.15em; }
+  .t-assistant h3 { font-size: 1.05em; }
+  .t-assistant p { margin: 0.4em 0; }
+  .t-assistant ul, .t-assistant ol { margin: 0.4em 0; padding-left: 1.6em; }
+  .t-assistant li { margin: 0.2em 0; }
+  .t-assistant code { background: #0a0a12; padding: 1px 5px; border-radius: 3px; font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 0.88em; color: #f8b878; }
+  .t-assistant pre { background: #0a0a12; padding: 10px 12px; border-radius: 6px; overflow-x: auto; margin: 0.5em 0; border: 1px solid #1e1e2a; }
+  .t-assistant pre code { background: none; padding: 0; color: #d0d0e0; font-size: 0.9em; }
+  .t-assistant a { color: #6ea3ff; text-decoration: none; }
+  .t-assistant a:hover { text-decoration: underline; }
+  .t-assistant strong { color: #f0f0f8; font-weight: 700; }
+  .t-assistant table { border-collapse: collapse; margin: 0.4em 0; font-size: 0.95em; }
+  .t-assistant th, .t-assistant td { border: 1px solid #1e1e2a; padding: 4px 8px; }
+  .t-assistant th { background: #14141e; }
+  .t-assistant blockquote { border-left: 3px solid #2a4060; padding-left: 10px; margin: 0.4em 0; color: #a0a0b0; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<!-- DOMPurify — agent results come from external task channels (Discord,
+     Telegram, voice, SMS) and aren't trusted input. marked@12 ships no
+     sanitizer by default, so unwrapped innerHTML on transcript replies would
+     execute embedded <script> / inline handlers. Sandbox before insertion. -->
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
 </head>
 <body>
 
@@ -2133,7 +2161,23 @@ function sendText() {
                 clearInterval(poll);
                 const re = document.createElement('div');
                 re.className = 't-entry t-assistant';
-                re.textContent = r.result;
+                // Render markdown if marked.js + DOMPurify both loaded; fall
+                // back to escaped textContent otherwise. Both required — marked
+                // alone would be unsafe innerHTML on agent results that
+                // originate from external task channels.
+                // Before this, headings/lists in long replies (e.g. skill
+                // suggestions) came through as raw "###" / "*" characters.
+                if (window.marked && window.DOMPurify) {
+                  try {
+                    re.innerHTML = window.DOMPurify.sanitize(
+                      window.marked.parse(r.result, { breaks: true, gfm: true })
+                    );
+                  } catch (e) {
+                    re.textContent = r.result;
+                  }
+                } else {
+                  re.textContent = r.result;
+                }
                 addCopyBtn(re);
                 $('transcript').appendChild(re);
                 $('transcript').scrollTop = $('transcript').scrollHeight;
@@ -2992,6 +3036,18 @@ const server = createServer((req, res) => {
 				res.end(JSON.stringify({ error: e instanceof Error ? e.message : 'parse failed' }));
 			}
 		});
+		return;
+	}
+
+	// Clean chat-first UI — Gemini/Claude-app style. Same task-bridge
+	// backend as the dashboard textbox; markdown rendering + full-viewport
+	// chat + persistent history. Lives at /chat to leave / untouched.
+	if (url.pathname === '/chat') {
+		res.writeHead(200, {
+			'Content-Type': 'text/html; charset=utf-8',
+			'Cache-Control': 'no-cache, no-store, must-revalidate',
+		});
+		res.end(CHAT_HTML);
 		return;
 	}
 

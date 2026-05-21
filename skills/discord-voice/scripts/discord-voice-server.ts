@@ -29,6 +29,7 @@ import { config as _dotenvConfig } from 'dotenv';
 import { mkdirSync, writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from '../../../src/workspace_default.js';
+import { recordConversation, recordSession } from '../../../src/conversation-store.js';
 
 _dotenvConfig({ path: new URL('../../../.env', import.meta.url).pathname, override: true });
 _dotenvConfig({ path: join(process.env.HOME ?? '', '.claude/channels/discord/.env'), override: false });
@@ -125,18 +126,17 @@ function detachVisionFromSession(): void {
 }
 
 // --- Conversation log -------------------------------------------------------
+// discord-voice mirrors turns into conversation.sqlite (queryable) AND the
+// shared logs/conversation.log text log — the same dual-write the phone path
+// uses. conversation.log is the canonical source the reload importer rebuilds
+// the sqlite `conversation` table from, so writing it keeps discord-voice rows
+// recoverable after `import-conversation-log.py --reload`.
+const CONVERSATION_LOG = join(WORKSPACE_DIR, 'logs', 'conversation.log');
 
-const LOG_PATH = join(
-	DATA_DIR,
-	`discord-voice-${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
-);
-
-function logLine(role: 'user' | 'assistant' | 'system', text: string, extra: Record<string, unknown> = {}): void {
+function appendConversationLog(role: string, text: string): void {
 	try {
-		appendFileSync(
-			LOG_PATH,
-			JSON.stringify({ timestamp: new Date().toISOString(), role, text, ...extra }) + '\n',
-		);
+		mkdirSync(dirname(CONVERSATION_LOG), { recursive: true });
+		appendFileSync(CONVERSATION_LOG, `${new Date().toISOString()}|${role}|${text.replace(/\n/g, ' ')}\n`);
 	} catch {}
 }
 
@@ -525,7 +525,9 @@ function subscribeUser(s: DiscordVoiceSession, userId: string): void {
 
 async function createVoiceSession(connection: VoiceConnection): Promise<DiscordVoiceSession> {
 	const bodhiPort = nextBodhiPort++;
-	const sessionId = `discord_voice_${Date.now()}`;
+	// Encode guild + channel into the session id so channel-level diagnostics
+	// survive into the sessions table (recordSession has no guild/channel field).
+	const sessionId = `discord_voice_${GUILD_ID}_${CHANNEL_ID}_${Date.now()}`;
 
 	// Outbound audio: queue of PCM 48k stereo buffers. When Gemini sends a
 	// chunk, push to queue. When player goes idle (or on first push), drain
@@ -647,11 +649,15 @@ async function createVoiceSession(connection: VoiceConnection): Promise<DiscordV
 			if (item.role === 'user') {
 				s.transcript.push({ role: 'user', text: item.content });
 				s.events.push({ event: `user:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('user', item.content);
+				// conversation.log is the primary; write it before the sqlite
+				// mirror so a row never exists in sqlite without a log line.
+				appendConversationLog('discord-user', item.content);
+				recordConversation('discord-user', item.content, s.sessionId);
 			} else if (item.role === 'assistant') {
 				s.transcript.push({ role: 'sutando', text: item.content });
 				s.events.push({ event: `sutando:${item.content}`, timestamp: new Date().toISOString() });
-				logLine('assistant', item.content);
+				appendConversationLog('discord-agent', item.content);
+				recordConversation('discord-agent', item.content, s.sessionId);
 			}
 		}
 		lastProcessedIdx = items.length;
@@ -722,21 +728,16 @@ function cleanupSession(s: DiscordVoiceSession): void {
 
 	s.events.push({ event: 'session_ended', timestamp: new Date().toISOString() });
 	const durationMs = Date.now() - s.startTime;
-	const metrics = {
-		timestamp: new Date().toISOString(),
+	recordSession({
+		source: 'discord-voice',
 		sessionId: s.sessionId,
-		guildId: s.guildId,
-		channelId: s.channelId,
 		durationMs,
 		transcriptLines: s.transcript.length,
-		toolCalls: s.toolCalls,
 		toolCount: s.toolCalls.length,
 		pendingTasks: s.pendingTasks,
+		toolCalls: s.toolCalls,
 		events: s.events,
-	};
-	try {
-		appendFileSync(join(DATA_DIR, 'discord-voice-metrics.jsonl'), JSON.stringify(metrics) + '\n');
-	} catch {}
+	});
 	console.log(`${ts()} [Voice] session finalized: ${s.sessionId} (${durationMs}ms, ${s.transcript.length} turns)`);
 }
 

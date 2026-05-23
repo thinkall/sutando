@@ -81,6 +81,9 @@ shopt -u nullglob
 #    rename — including the source path AFTER the file has moved out.
 #    `[ -f "$path" ]` filters those rename-OUT-of-watched-dir events.
 #    Caught 2026-05-03 #1 (PR #572).
+LAST_EMIT_BN=""
+LAST_EMIT_SEC=$SECONDS
+
 fswatch \
   -l 0.5 \
   --event Created \
@@ -89,13 +92,19 @@ fswatch \
 | while IFS= read -r path; do
   case "$path" in
     *.txt)
+      bn="$(basename "$path")"
+      # Dedup: task_bump_attempts.py uses atomic rename (tmp→file) which
+      # re-triggers fswatch's Renamed filter, causing an infinite loop.
+      # Suppress re-emission of the same basename within a 3s cooldown.
+      if [ "$bn" = "$LAST_EMIT_BN" ] && [ $(( SECONDS - LAST_EMIT_SEC )) -lt 3 ]; then
+        continue
+      fi
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
-        # Restart-safety #4: bump `attempts:` BEFORE emit. For
-        # fresh-file events this sets attempts=1; fswatch dedupe
-        # prevents same-session double-bumps from burst events.
         python3 "$SCRIPT_DIR/task_bump_attempts.py" "$path" 2>/dev/null || true
-        echo "TASK_FILE: $(basename "$path")"
+        echo "TASK_FILE: $bn"
+        LAST_EMIT_BN="$bn"
+        LAST_EMIT_SEC=$SECONDS
       fi
       ;;
   esac

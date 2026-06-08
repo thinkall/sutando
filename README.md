@@ -225,6 +225,12 @@ The Windows scripts mirror their `.sh` twins:
 - **Phone-call flow** — `startup.ps1` skips Twilio + ngrok auto-launch. If you want phone calls on Windows, start ngrok manually and set `WEBHOOK_BASE_URL` in `.env`.
 - **macOS permissions block** — Windows has no TCC; screen capture and microphone "just work" once you grant Chrome microphone access.
 
+**Task-loop architecture (Windows-specific).** macOS Claude Code exposes a `Monitor` tool that streams stdout from a long-running command (e.g. `bash src/watch-tasks-stream.sh`) and wakes the agent on every `TASK_FILE:` event. Claude Code 2.1.168 on Windows **does not include the `Monitor` tool** (verified: not in the agent's tool list, and the literal string `"Monitor"` is absent from `claude.exe`). Without Monitor, there's no push-based file-watch primitive available to the agent, so the long-running `sutando-core` TUI would only pick up new tasks on its `*/5` proactive-loop cron tick — fine for autonomous work, far too slow for chat.
+
+The Windows port works around this with `src/task-dispatcher.ps1`, a standalone process auto-launched by `src/startup.ps1`. It uses `FileSystemWatcher` to watch `tasks/`, claims new files via atomic rename, and runs each one through `claude --print` as a one-shot subprocess. End-to-end chat latency is ~5s. The long-running core still handles autonomous proactive-loop work + cron jobs; the dispatcher only intercepts user-driven chat tasks.
+
+**Trade-off:** each dispatched task is its own `claude --print` subprocess, so there's no shared conversational context across chat turns. If you say "what's the weather" and follow up with "and in Tokyo?", the second call won't know about the first. If you want continuity, opt out via `pwsh -File src/startup.ps1 -SkipDispatcher` and accept the cron-tick latency.
+
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it
 - "Summon my computer to zoom" — opens Zoom with screen sharing, join from your phone

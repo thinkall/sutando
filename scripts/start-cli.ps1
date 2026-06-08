@@ -39,8 +39,8 @@ if ($Restart) {
     $existing = Get-CorePids
     if ($existing) {
         Write-Host "Killing existing sutando-core session (pid $($existing -join ', '))..."
-        foreach ($pid in $existing) {
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+        foreach ($corePid in $existing) {
+            Stop-Process -Id $corePid -Force -ErrorAction SilentlyContinue
         }
         Start-Sleep -Seconds 1
     }
@@ -75,7 +75,15 @@ $claudeArgs = @(
     '--dangerously-skip-permissions',
     '--add-dir', $HOME,
     '--',
-    '/schedule-crons'
+    # /proactive-loop calls /schedule-crons internally AND immediately starts
+    # the streaming task watcher (`Bash run_in_background: true` on the
+    # platform-appropriate watch-tasks-stream script) + the per-pass body. On
+    # macOS the equivalent macOS-side start-cli.sh launches with /schedule-crons
+    # and waits ~5min for the first proactive-loop cron tick — which is too slow
+    # for the chat path (tasks visibly hang for minutes). Going straight to
+    # /proactive-loop closes that gap on first start and the cron picks up from
+    # there.
+    '/proactive-loop'
 )
 
 if ($NoWindow) {

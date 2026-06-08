@@ -21,6 +21,8 @@ If an interval is provided in ARGUMENTS (e.g. "5m", "10m", "30m"), use it. Other
 1. Run `/schedule-crons` to set up all recurring cron jobs (morning briefing, Zacks, etc.)
 2. Start the streaming task watcher via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh'`, `persistent: true`, `description: 'Streaming task watcher'`. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive.
 
+   **Windows:** the `Monitor` tool is not present in Claude Code 2.1.168 on Windows, so step 3 is a no-op there. Push-based task processing on Windows is handled by `src/task-dispatcher.ps1` (started from `src/startup.ps1`), an external `FileSystemWatcher` that invokes `claude --print` per task. The core agent only handles cron-driven autonomous work on Windows; user chat tasks land in `results/` via the dispatcher.
+
 ## Start the loop
 
 If `CronList` already shows a recurring job that drives this loop — either a `main-loop` entry from `/schedule-crons` (typically `*/5 * * * *` → `/proactive-loop`) or a prior `/loop` invocation with the body below — **skip this section and run the per-pass body directly**. That cron is the canonical driver; adding another would compound on every fire — each `/proactive-loop` invocation would re-run `/loop`, scheduling another recurring job and growing the cron list unboundedly.

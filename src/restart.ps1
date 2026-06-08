@@ -26,7 +26,8 @@ $patterns = @(
     'slack-bridge',
     'conversation-server',
     'credential-proxy',
-    'watch-tasks-stream'
+    'watch-tasks-stream',
+    'task-dispatcher'
 )
 
 foreach ($pat in $patterns) {

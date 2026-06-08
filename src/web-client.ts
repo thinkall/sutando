@@ -11,6 +11,7 @@
 import { createServer, request as httpRequest } from 'node:http';
 import { writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { readTmuxStatus } from './tmux-status.js';
 import { CHAT_HTML } from './chat-ui.js';
@@ -3753,7 +3754,7 @@ const server = createServer((req, res) => {
 					return;
 				}
 				const event = { slug: body.slug, content: body.content, ts: new Date().toISOString() };
-				writeFileSync('/tmp/sutando-note-viewing.json', JSON.stringify(event));
+				writeFileSync(join(tmpdir(), 'sutando-note-viewing.json'), JSON.stringify(event));
 				res.writeHead(200, { 'Content-Type': 'application/json' });
 				res.end(JSON.stringify({ ok: true }));
 			} catch (e) {

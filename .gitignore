@@ -115,3 +115,6 @@ workspace/*
 !workspace/.gitkeep
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt
+
+# IDE / editor workspace state — per-user, never shared.
+.vscode/

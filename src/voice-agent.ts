@@ -30,16 +30,31 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { notify as platformNotify } from './platform.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
+// Soft platform check — the voice agent itself is cross-platform (it just
+// pipes audio to/from Gemini Live), but several inline tools are macOS-only
+// (AppleScript-driven app automation, QuickTime control, Chrome AppleEvents).
+// Emit a single warning on non-macOS so Windows/Linux operators know to expect
+// `macOSOnly` errors from those tools, but DON'T exit — the core
+// voice loop, clipboard, screen capture, and task bridge all work.
+function assertMacOS() {
+	if (process.platform !== 'darwin') {
+		console.warn(
+			`[voice-agent] running on ${process.platform} — voice + screen capture + clipboard ` +
+			`work, but AppleScript-driven tools (switch_app, type_text, slide_control, etc.) ` +
+			`will return macOSOnly errors. See README "Windows support" section.`,
+		);
+	}
+}
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
 import { startVoiceTicker, type TickerControl } from './observability/realtime.js';
@@ -300,17 +315,22 @@ function applyModeRequest() {
 }
 setInterval(applyModeRequest, 1_000);
 
-// Detect active meeting on startup — sync so it runs before first greeting
+// Detect active meeting on startup — sync so it runs before first greeting.
+// Skips on non-macOS: pgrep + osascript aren't available on Windows, and the
+// Zoom meeting-detection heuristic is macOS-shaped (process.zoom.us + window
+// count via System Events). Windows would need a different probe; left as a
+// follow-up.
 try {
-	const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-	if (zoomRunning) {
-		const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-		if (parseInt(inMeeting) >= 2) {
-			meetingActive = true;
-			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+	if (process.platform === 'darwin') {
+		const zoomRunning = execFileSync('/usr/bin/pgrep', ['-f', 'zoom.us'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+		if (zoomRunning) {
+			const inMeeting = execFileSync('osascript', ['-e', 'tell application "System Events" to tell process "zoom.us" to count of windows'], { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+			if (parseInt(inMeeting) >= 2) {
+				meetingActive = true;
+				console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+			}
 		}
 	}
-} catch { /* no zoom */ }
 
 // Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
 // the on-disk state matches the in-memory `meetingActive` decision (was
@@ -1076,14 +1096,11 @@ async function main() {
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
-			// OS notification — visible even if no browser tab is open.
-			// execFileSync avoids the shell entirely, so no sanitization of
-			// single-quotes or other shell metacharacters is needed. The
-			// double-quote stripping below protects the AppleScript string
-			// literal itself (not the shell).
+			// OS notification — visible even if no browser tab is open. Routed
+			// through the cross-platform platform.notify helper (osascript on
+			// macOS, PowerShell balloon-tip on Windows, notify-send on Linux).
 			try {
-				const safe = c.userMessage.replace(/["\\]/g, '');
-				execFileSync('osascript', ['-e', `display notification "${safe}" with title "Sutando — voice offline"`], { stdio: 'ignore' });
+				platformNotify(c.userMessage, 'Sutando — voice offline');
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {
@@ -1236,7 +1253,7 @@ async function main() {
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;
-	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
+	const liveTranscriptPath = join(tmpdir(), 'sutando-live-transcript-voice.txt');
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;

@@ -1,6 +1,10 @@
 /**
  * Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
  * Split from inline-tools.ts for readability.
+ *
+ * macOS-only: every tool here drives Google Chrome through AppleScript. On
+ * Windows the tools degrade to a `macOSOnly` error so Gemini knows to fall
+ * back to telling the user instead of silently no-op'ing.
  */
 
 import { execSync, execFileSync } from 'node:child_process';
@@ -10,6 +14,7 @@ import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef } from './recording-state.js';
 import { resolveWorkspace } from './workspace_default.js';
+import { isMacOS, macOSOnlyError } from './platform.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -46,6 +51,7 @@ export const scrollTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { direction, amount, target: _rawTarget } = args as { direction: 'down' | 'up' | 'top' | 'bottom'; amount?: 'small' | 'medium' | 'large'; target?: string };
+		if (!isMacOS()) return macOSOnlyError('scroll');
 		// "window"/"page"/"main" etc. mean the MAIN page, not a CSS selector. The model
 		// habitually passes target:"window" (2026-06-09 live test): the selector branch
 		// matched nothing, its <500px-wide fallback skipped GitHub's full-width scroller,
@@ -169,6 +175,7 @@ export const switchTabTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { keyword } = args as { keyword: string };
+		if (!isMacOS()) return macOSOnlyError('switch_tab');
 		// Resolve aliases to URL patterns
 		const alias = TAB_ALIASES[keyword.toLowerCase()];
 		const searchTerms = alias ? [keyword, alias] : [keyword];
@@ -252,6 +259,7 @@ export const closeTabTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('close_tab');
 		try {
 			execSync(`osascript -e 'tell application "Google Chrome" to tell front window to close active tab'`, { timeout: 5_000 });
 			console.log(`${ts()} [CloseTab] closed active tab`);
@@ -286,6 +294,7 @@ export const openUrlTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { url: rawUrl } = args as { url: string };
+		if (!isMacOS()) return macOSOnlyError('open_url');
 		// Normalize spoken-URL artifacts before handing to osascript. The LLM
 		// sometimes passes a URL with surrounding whitespace from voice
 		// transcription, or with embedded spaces that AppleScript / Chrome
@@ -461,6 +470,7 @@ export const clickTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { x, y, shortcut } = args as { x?: number; y?: number; shortcut?: string };
+		if (!isMacOS()) return macOSOnlyError('click');
 		try {
 			if (shortcut) {
 				// Parse shortcut like "cmd+shift+5"
@@ -532,6 +542,7 @@ export const pointAtTool: ToolDefinition = {
 	execution: 'inline',
 	async execute(args) {
 		const { query } = args as { query: string };
+		if (!isMacOS()) return macOSOnlyError('point_at');
 		// Free-tier eligible voice key preferred (the POC proved gemini-3-flash-preview
 		// works on it); falls back to the paid key. Same precedence as describe_screen.
 		const apiKey = process.env.GEMINI_VOICE_API_KEY || process.env.GEMINI_API_KEY;

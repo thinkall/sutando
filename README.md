@@ -124,13 +124,13 @@ Voice agent and conversation server handle conversation-scope actions with **inl
 ## Quick start
 
 **Prerequisites:**
-- macOS 15+
+- macOS 15+ **or** Windows 11 (see [Windows support](#windows-support) below for what works)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/getting-started) (run `claude` once to complete login)
-- Node.js 22+ (`brew install node`)
-- fswatch (`brew install fswatch`)
+- Node.js 22+ (`brew install node` on macOS, [nodejs.org](https://nodejs.org) on Windows)
+- fswatch — macOS only (`brew install fswatch`). Windows uses a built-in PowerShell `FileSystemWatcher` shim.
 - [Gemini API key](https://ai.google.dev) (click "Get API key")
 - *(optional, for phone calls)* [Twilio account](https://www.twilio.com/) + [ngrok](https://ngrok.com/) — Sutando can answer inbound calls and make outbound calls; you can run the browser + Telegram + Discord paths without them.
-- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg`) — used by subtitle-burn, video-concat, and recording handoff.
+- *(optional, for video/audio)* ffmpeg (`brew install ffmpeg` on macOS, [ffmpeg.org](https://ffmpeg.org/download.html) on Windows) — used by subtitle-burn, video-concat, and recording handoff.
 
 ```bash
 # Clone
@@ -141,8 +141,11 @@ cd sutando
 cp .env.example .env
 # Edit .env — add your GEMINI_API_KEY (from Google AI Studio)
 
-# Start everything
+# Start everything (macOS / Linux)
 bash src/startup.sh
+
+# Start everything (Windows)
+pwsh -File src/startup.ps1
 ```
 
 This starts all services (voice agent, phone conversation server, web client, dashboard, API, Sutando menu bar app) and opens http://localhost:8080 in your browser. The autonomous loop starts automatically — click **Connect** and start talking. Look for **S** in your menu bar — it provides global hotkeys (see [Keyboard shortcuts](#keyboard-shortcuts)) plus **Open Core** (Claude Code terminal) and **Open Dashboard** (status page).
@@ -159,6 +162,68 @@ This starts all services (voice agent, phone conversation server, web client, da
 **Why macOS 15+?** The setup scripts assume the Sequoia System Settings layout for granting TCC permissions (Screen Recording, Accessibility, Input Monitoring). Earlier macOS versions may work for the headless parts (proactive loop, Discord/Telegram bridges) but aren't tested.
 
 **macOS permissions** — on first run, macOS will ask you to grant Screen Recording, Accessibility, and Microphone access. See [Security](#security) for what each permission is used for.
+
+## Windows support
+
+Sutando started life on macOS and most of its app-automation surface — AppleScript-driven Chrome/QuickTime control, Cmd+Ctrl+F fullscreen, the Sutando menu-bar Swift app — has no portable Windows equivalent. The core Sutando loop nevertheless runs on Windows 11; what's there is the headless agent: voice, screen capture, clipboard, notifications, the task bridge, the dashboard, and the messaging bridges.
+
+**Works on Windows:**
+- Voice agent (Gemini Live WebSocket on :9900) — talk to Sutando in the browser
+- Web client (:8080) and Dashboard (:7844) and Agent API (:7843)
+- Screen capture (:7845) — uses PowerShell `System.Drawing.Bitmap` instead of `screencapture`
+- Task bridge — file-based; uses a PowerShell `FileSystemWatcher` shim in place of `fswatch`
+- Clipboard (Get-Clipboard / Set-Clipboard) and desktop notifications (balloon-tip)
+- Telegram, Discord, Slack bridges (any feature that runs in the core agent)
+- Capture screen + describe screen tools
+
+**Returns a `macOSOnly` error on Windows (the voice agent stays up; Gemini tells the user):**
+- `switch_app`, `press_key`, `type_text`, `volume`, `brightness`, `fullscreen`, `slide_control`, `toggle_tasks`
+- `scroll`, `switch_tab`, `close_tab`, `open_url`, `click`, `point_at` (browser AppleEvents)
+- `join_gmeet`, `call_contact` (Chrome AppleScript)
+- `screen_record`, `play_video`, `pause_video`, `resume_video`, `replay_video`, `close_video`, `scroll_and_describe` (QuickTime + Chrome)
+- Sutando.app menu-bar shortcuts (Swift/Cocoa), Twilio + ngrok auto-launch from startup
+
+**Windows quickstart:**
+
+```powershell
+# Clone (PowerShell)
+git clone https://github.com/sonichi/sutando.git
+cd sutando
+
+# Configure
+Copy-Item .env.example .env
+# Edit .env in your editor; set GEMINI_API_KEY
+
+# Install dependencies + start everything
+pwsh -File src/startup.ps1
+
+# Stop everything
+pwsh -File src/restart.ps1 -StopOnly
+
+# Restart
+pwsh -File src/restart.ps1
+```
+
+The Windows scripts mirror their `.sh` twins:
+- `src/startup.ps1` — launches voice agent + web client + dashboard + agent API + screen capture (+ optional bridges)
+- `src/restart.ps1` — stops everything, then starts (matches `restart.sh`)
+- `src/notify.ps1 "msg"` — desktop notification + Discord DM (matches `notify.sh`)
+- `src/watch-tasks-stream.ps1` — task-folder watcher; emits `TASK_FILE: …` per new file
+
+**Prerequisites:**
+- Windows 11
+- PowerShell 7+ (`winget install Microsoft.PowerShell` — `pwsh` shim)
+- Node.js 22+ from [nodejs.org](https://nodejs.org)
+- Python 3.11+ from [python.org](https://python.org) (used by the dashboard, agent API, and bridges)
+- Claude Code installed and logged in (`claude` once)
+
+**Workspace:** identical contract as macOS — defaults to `%USERPROFILE%\.sutando\workspace\` unless `SUTANDO_WORKSPACE` is set in `.env`.
+
+**What's not ported (and why):**
+- **Sutando.app menu bar** — Swift / AppKit, no Windows equivalent. The global ⌃C / ⌃V / ⌃M shortcuts aren't available; use the web client UI instead.
+- **AppleScript-driven app automation** — Windows has no equivalent of System Events that's portable from the CLI. UIAutomation via PowerShell could replace some of this if there's demand.
+- **Phone-call flow** — `startup.ps1` skips Twilio + ngrok auto-launch. If you want phone calls on Windows, start ngrok manually and set `WEBHOOK_BASE_URL` in `.env`.
+- **macOS permissions block** — Windows has no TCC; screen capture and microphone "just work" once you grant Chrome microphone access.
 
 **Try saying:**
 - "What's on my screen?" — takes a screenshot and describes it

@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
 """
-Screen capture HTTP server — runs in a terminal (has Screen Recording permission).
+Screen capture HTTP server — runs in a terminal (has Screen Recording permission
+on macOS; needs no special setup on Windows).
 The voice agent calls http://localhost:7845/capture to get instant screenshots.
 
 Usage: python3 src/screen-capture-server.py
-(Run in a terminal window — NOT as a launchd daemon)
+(On macOS: run in a terminal window — NOT as a launchd daemon, because the
+terminal app holds the Screen Recording TCC grant.)
 """
 
 import http.server
 import subprocess
 import json
 import os
+import sys
+import tempfile
 import threading
 import urllib.request
 import os as _os
 from datetime import datetime
+from pathlib import Path
+
+# Cross-platform OS helpers. `sutando_platform.notify` + `sutando_platform.capture_screen`
+# branch on sys.platform so the legacy macOS code paths stay verbatim.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sutando_platform import capture_screen as _platform_capture_screen, notify as _platform_notify, is_macos, is_windows  # noqa: E402
 
 PORT = 7845
-DIR = "/tmp/sutando-screenshots"
+# Screenshot scratch dir under the OS temp dir so Windows works without /tmp.
+DIR = os.path.join(tempfile.gettempdir(), "sutando-screenshots")
 # Web-client endpoint for agent-state reporting. When a /capture happens we
 # flash state=seeing on the menu-bar avatar for ~1.5s — makes screen-capture
 # visible to the user without them needing to watch the web UI.
@@ -51,24 +62,20 @@ def _signal_seeing():
 
 
 def _notify_capture_blocking():
-    """Fire a macOS notification that Sutando captured the screen. Chi's ask
+    """Fire a desktop notification that Sutando captured the screen. Chi's ask
     per 2026-04-18 Discord: "shall we use a notification when taking
-    screenshots?". Uses osascript (no additional deps). Debounced to
-    avoid notification-center spam during describe_screen loops."""
+    screenshots?". Routed through `sutando_platform.notify` so the macOS osascript
+    backend and the Windows PowerShell balloon-tip backend both work without
+    branching here. Debounced to avoid notification-center spam during
+    describe_screen loops."""
     try:
-        import subprocess as _sp
-        _sp.run(
-            ["osascript", "-e",
-             'display notification "Captured screen" with title "Sutando"'],
-            timeout=1.0,
-            capture_output=True,
-        )
+        _platform_notify("Captured screen")
     except Exception:
         pass  # Best-effort; notification absence is never critical.
 
 
 def _notify_capture():
-    """Debounced fire-and-forget macOS notification."""
+    """Debounced fire-and-forget desktop notification."""
     global _last_notify_ts
     if not NOTIFY_ENABLED:
         return
@@ -114,11 +121,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ext = "jpg" if fmt in ("jpg", "jpeg") else "png"
             type_flag = "jpg" if ext == "jpg" else "png"
             try:
-                if capture_all:
+                # macOS-only: per-display capture via `screencapture -D<n>`.
+                # Windows: per-display capture is not implemented in the
+                # PowerShell helper yet — fall through to a single virtual-
+                # screen capture so the request still succeeds.
+                if capture_all and is_macos():
                     # Capture all displays separately
                     paths = []
                     for d in range(1, 5):  # up to 4 displays
-                        p = f"{DIR}/screen-{ts}-d{d}.{ext}"
+                        p = os.path.join(DIR, f"screen-{ts}-d{d}.{ext}")
                         result = subprocess.run(["screencapture", "-x", "-t", type_flag, f"-D{d}", p], timeout=5, capture_output=True)
                         if result.returncode == 0 and os.path.exists(p) and os.path.getsize(p) > 0:
                             paths.append(p)
@@ -126,16 +137,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             try: os.unlink(p)
                             except Exception: pass
                             break  # no more displays
-                    path = paths[0] if paths else f"{DIR}/screen-{ts}.{ext}"
-                else:
-                    suffix = f"-d{display}" if display else ""
-                    path = f"{DIR}/screen-{ts}{suffix}.{ext}"
+                    path = paths[0] if paths else os.path.join(DIR, f"screen-{ts}.{ext}")
+                elif is_macos() and display:
+                    suffix = f"-d{display}"
+                    path = os.path.join(DIR, f"screen-{ts}{suffix}.{ext}")
                     paths = [path]
                     cmd = ["screencapture", "-x", "-t", type_flag]
-                    if display:
-                        cmd.append(f"-D{display}")
+                    cmd.append(f"-D{display}")
                     cmd.append(path)
                     subprocess.run(cmd, timeout=5, check=True)
+                else:
+                    # Default path — single primary-display capture. Goes through
+                    # the cross-platform `sutando_platform.capture_screen` helper, which
+                    # uses screencapture on macOS and PowerShell + System.Drawing
+                    # on Windows.
+                    path = os.path.join(DIR, f"screen-{ts}.{ext}")
+                    paths = [path]
+                    ok = _platform_capture_screen(path, fmt=ext)
+                    if not ok:
+                        raise RuntimeError(
+                            "capture_screen returned False — check Screen Recording "
+                            "perm (macOS) or PowerShell availability (Windows)"
+                        )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()

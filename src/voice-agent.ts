@@ -28,16 +28,31 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { execSync as execSyncTop } from 'node:child_process';
+import { notify as platformNotify } from './platform.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater } from './vision-tools.js';
 import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
-function assertMacOS() { if (process.platform !== 'darwin') { console.error('Sutando requires macOS'); process.exit(1); } }
+// Soft platform check — the voice agent itself is cross-platform (it just
+// pipes audio to/from Gemini Live), but several inline tools are macOS-only
+// (AppleScript-driven app automation, QuickTime control, Chrome AppleEvents).
+// Emit a single warning on non-macOS so Windows/Linux operators know to expect
+// `macOSOnly` errors from those tools, but DON'T exit — the core
+// voice loop, clipboard, screen capture, and task bridge all work.
+function assertMacOS() {
+	if (process.platform !== 'darwin') {
+		console.warn(
+			`[voice-agent] running on ${process.platform} — voice + screen capture + clipboard ` +
+			`work, but AppleScript-driven tools (switch_app, type_text, slide_control, etc.) ` +
+			`will return macOSOnly errors. See README "Windows support" section.`,
+		);
+	}
+}
 import { workTool, startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, resetNoteViewingDebounce, logConversation, logSessionBoundary, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback } from './task-bridge.js';
 import { recordSession, recordToolCall } from './conversation-store.js';
 import { buildSutandoSystemPrompt, buildVoiceAgentContext } from './voice-context.js';
@@ -56,16 +71,20 @@ let generateSpeech: ((text: string, opts: { category: string; label: string }) =
 // Config
 // =============================================================================
 
-// Shape check: a valid Google AI Studio key starts with "AIza" and is
-// typically 39 chars (v1 format). Catches common misconfigurations
-// (truncated paste, wrong variable, stale template value) at startup
-// instead of letting the voice session fail silently on connect.
+// Shape check: a valid Google AI Studio key historically starts with "AIza"
+// (~39 chars, v1 format) but Google has since issued keys with other prefixes
+// (e.g. "AQ.A..." ~53 chars). Catches common misconfigurations (truncated
+// paste, wrong variable, stale template value) at startup instead of letting
+// the voice session fail silently on connect.
 function assertGeminiKey(name: string, value: string): void {
 	if (!value) { console.error(`Error: ${name} is required`); process.exit(1); }
-	// Upper bound of 60 (vs canonical ~39) gives headroom for Google key
-	// format rotations — Mini flagged they rotated once (2020→2023) and a
-	// tight bound would fail-fast on legitimate future keys.
-	const looksValid = value.startsWith('AIza') && value.length >= 35 && value.length <= 60;
+	// Length window covers both the legacy AIza format (~39) and the newer
+	// AQ.A prefix format (~53). Upper bound of 80 gives headroom for future
+	// rotations. Prefix list rather than a single startsWith keeps the
+	// fail-fast posture for obvious wrong-key cases (Anthropic keys start
+	// with "sk-ant-", OpenAI with "sk-", etc.).
+	const validPrefixes = ['AIza', 'AQ.'];
+	const looksValid = validPrefixes.some(p => value.startsWith(p)) && value.length >= 35 && value.length <= 80;
 	if (!looksValid) {
 		// Do NOT interpolate anything derived from `value` into the log —
 		// CodeQL's js/clear-text-logging treats env vars matching the KEY
@@ -76,7 +95,7 @@ function assertGeminiKey(name: string, value: string): void {
 		// static: name + expected format + remediation URL.
 		console.error(
 			`Error: ${name} does not look like a Google AI Studio key ` +
-			`(expected "AIza..." 35-60 chars). ` +
+			`(expected "AIza..." or "AQ.A..." 35-80 chars). ` +
 			`Rotate at https://ai.google.dev → "Get API key" and update .env.`
 		);
 		process.exit(1);
@@ -297,17 +316,23 @@ function applyModeRequest() {
 }
 setInterval(applyModeRequest, 1_000);
 
-// Detect active meeting on startup — sync so it runs before first greeting
+// Detect active meeting on startup — sync so it runs before first greeting.
+// Skips on non-macOS: pgrep + osascript aren't available on Windows, and the
+// Zoom meeting-detection heuristic is macOS-shaped (process.zoom.us + window
+// count via System Events). Windows would need a different probe; left as a
+// follow-up.
 try {
-	const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
-	if (zoomRunning) {
-		const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
-		if (parseInt(inMeeting) >= 2) {
-			meetingActive = true;
-			console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+	if (process.platform === 'darwin') {
+		const zoomRunning = execSyncTop('pgrep -f "zoom.us" 2>/dev/null', { encoding: 'utf-8' }).trim();
+		if (zoomRunning) {
+			const inMeeting = execSyncTop(`osascript -e 'tell application "System Events" to tell process "zoom.us" to count of windows' 2>/dev/null`, { encoding: 'utf-8' }).trim();
+			if (parseInt(inMeeting) >= 2) {
+				meetingActive = true;
+				console.log(`${new Date().toLocaleTimeString()} [Meeting] Detected active Zoom meeting on startup`);
+				}
+			}
 		}
-	}
-} catch { /* no zoom */ }
+	} catch { /* no zoom */ }
 
 // Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
 // the on-disk state matches the in-memory `meetingActive` decision (was
@@ -1050,15 +1075,11 @@ async function main() {
 			} catch (e) {
 				console.error(`${ts()} [VoiceFailure] proactive write failed: ${(e as Error)?.message ?? e}`);
 			}
-			// OS notification — visible even if no browser tab is open.
-			// Sanitize the message for the AppleScript string literal: drop
-			// double-quotes and backslashes so the shell command can't break.
+			// OS notification — visible even if no browser tab is open. Routed
+			// through the cross-platform platform.notify helper (osascript on
+			// macOS, PowerShell balloon-tip on Windows, notify-send on Linux).
 			try {
-				const safe = c.userMessage.replace(/["\\]/g, '');
-				execSyncTop(
-					`osascript -e 'display notification "${safe}" with title "Sutando — voice offline"'`,
-					{ stdio: 'ignore' } as any,
-				);
+				platformNotify(c.userMessage, 'Sutando — voice offline');
 			} catch {}
 		};
 		transport.onClose = (code?: number, reason?: string) => {
@@ -1211,7 +1232,7 @@ async function main() {
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;
-	const liveTranscriptPath = '/tmp/sutando-live-transcript-voice.txt';
+	const liveTranscriptPath = join(tmpdir(), 'sutando-live-transcript-voice.txt');
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;

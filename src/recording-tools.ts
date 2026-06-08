@@ -1,6 +1,9 @@
 /**
  * Recording, video playback, and scroll-and-describe tools.
  * Extracted from browser-tools.ts for readability.
+ *
+ * macOS-only: every tool here drives QuickTime Player or Google Chrome via
+ * AppleScript. On Windows the tools degrade to a `macOSOnly` error.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -8,6 +11,7 @@ import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, stat
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
+import { isMacOS, macOSOnlyError } from './platform.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -375,6 +379,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
+		if (!isMacOS()) return macOSOnlyError('scroll_and_describe');
 		const MAX_DURATION = 60;
 		const rawDuration = (args as { duration_seconds?: number }).duration_seconds ?? 15;
 		const duration_seconds = Math.min(rawDuration, MAX_DURATION);
@@ -545,6 +550,7 @@ export const playVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('play_video');
 		console.log(`${ts()} [PlayVideo] called`);
 		lastResumeTime = Date.now(); // Set cooldown on play to prevent auto-pause
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
@@ -557,6 +563,7 @@ export const resumeVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('resume_video');
 		console.log(`${ts()} [ResumeVideo] called`);
 		// Only resume if user said "resume"/"continue"/"go on"/"play" in recent transcript.
 		// Picks freshest of voice-agent vs phone transcript; fail-open if neither is fresh.
@@ -594,6 +601,7 @@ export const replayVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('replay_video');
 		console.log(`${ts()} [ReplayVideo] called`);
 		try { return await startPlayback(0); } catch (err) { return { error: `${err}` }; }
 	},
@@ -608,6 +616,7 @@ export const pauseVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('pause_video');
 		console.log(`${ts()} [PauseVideo] called`);
 		// Block pause for 8s after play/resume to prevent Gemini from hearing video audio and auto-pausing
 		const sinceLast = Date.now() - lastResumeTime;
@@ -637,6 +646,7 @@ export const closeVideoTool: ToolDefinition = {
 	parameters: z.object({}),
 	execution: 'inline',
 	async execute() {
+		if (!isMacOS()) return macOSOnlyError('close_video');
 		console.log(`${ts()} [CloseVideo] called`);
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
@@ -666,6 +676,7 @@ export const screenRecordTool: ToolDefinition = {
 	}),
 	execution: 'inline',
 	async execute(args) {
+		if (!isMacOS()) return macOSOnlyError('screen_record');
 		const { action, duration_seconds, subtitle } = args as { action: 'start' | 'stop'; duration_seconds?: number; subtitle?: boolean };
 		// Hard block: if already recording, refuse to start again
 		if (action === 'start' && demoStateRef.value === 'recording') {

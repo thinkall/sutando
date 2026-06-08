@@ -94,3 +94,6 @@ voice-state.json
 
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
+
+# IDE / editor workspace state — per-user, never shared.
+.vscode/

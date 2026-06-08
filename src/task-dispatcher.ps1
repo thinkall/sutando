@@ -101,6 +101,60 @@ function Get-TaskPrompt($path) {
     return $content.Trim()
 }
 
+# Parse a `key: value` header line from the task body. Returns the trimmed
+# value (or $null). Used to extract channel_id so each surface gets its own
+# resumable claude session.
+function Get-TaskHeader($path, $key) {
+    $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
+    if (-not $content) { return $null }
+    if ($content -match "(?m)^${key}:\s*(.+?)\s*$") {
+        return $Matches[1].Trim()
+    }
+    return $null
+}
+
+# Session map persists across dispatcher restarts so a channel keeps the same
+# resumable claude conversation. Schema:
+#   { "<channel_id>": "<session-uuid>", ... }
+# Path: <workspace>/state/dispatcher-sessions.json
+$SESSION_FILE = Join-Path $WORKSPACE 'state\dispatcher-sessions.json'
+$sessionLock  = New-Object Object
+
+function Load-SessionMap {
+    if (-not (Test-Path $SESSION_FILE)) { return @{} }
+    try {
+        $raw = Get-Content -Raw -Path $SESSION_FILE -ErrorAction Stop
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        $h = @{}
+        foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = $p.Value }
+        return $h
+    } catch {
+        Log "session map: failed to load ($_); starting empty"
+        return @{}
+    }
+}
+
+function Save-SessionMap($map) {
+    try {
+        $json = $map | ConvertTo-Json -Depth 3 -Compress
+        # Write to a tmp file then move - avoids torn writes if the dispatcher
+        # is killed mid-write while another process is reading.
+        $tmp = "$SESSION_FILE.tmp"
+        Set-Content -Path $tmp -Value $json -NoNewline
+        Move-Item -Path $tmp -Destination $SESSION_FILE -Force
+    } catch {
+        Log "session map: failed to save ($_)"
+    }
+}
+
+# Single in-memory copy; serialize all reads/writes under $sessionLock so
+# concurrent task processing doesn't race on Get/Set.
+$script:sessions = Load-SessionMap
+Log "session map: loaded $(($script:sessions.Keys | Measure-Object).Count) channel(s)"
+
+# New-Guid v4 - used when a channel needs a fresh session.
+function New-SessionId { [guid]::NewGuid().ToString() }
+
 # Claim a task by renaming it to `.processing` - atomic on NTFS. Returns the
 # new path on success, $null if some other process already claimed it.
 function Claim-Task($file) {
@@ -119,21 +173,92 @@ function Process-Task($claimedPath, $taskId) {
         Log "${taskId}: empty prompt, skipping"
         return
     }
-    Log "${taskId}: processing ($(($prompt -split '\r?\n')[0].Substring(0, [Math]::Min(60, ($prompt -split '\r?\n')[0].Length))))"
 
-    # Send the task body to claude --print via stdin. --dangerously-skip-permissions
+    # Resolve channel + session. Default channel `local` covers tasks with no
+    # channel_id (older test fixtures, ad-hoc producers). Per-channel mapping
+    # so voice/discord/telegram each retain their own conversation thread.
+    $channel = Get-TaskHeader $claimedPath 'channel_id'
+    if (-not $channel) { $channel = 'local' }
+
+    [System.Threading.Monitor]::Enter($sessionLock)
+    try {
+        $sessionId = $script:sessions[$channel]
+        $isNew = $false
+        if (-not $sessionId) {
+            $sessionId = New-SessionId
+            $script:sessions[$channel] = $sessionId
+            Save-SessionMap $script:sessions
+            $isNew = $true
+        }
+    } finally {
+        [System.Threading.Monitor]::Exit($sessionLock)
+    }
+
+    $promptHead = ($prompt -split '\r?\n')[0]
+    $promptHead = $promptHead.Substring(0, [Math]::Min(60, $promptHead.Length))
+    Log "${taskId}: processing channel=$channel session=$sessionId$(if ($isNew) { ' (NEW)' }) ($promptHead)"
+
+    # First call to a channel uses --session-id (creates the session with that
+    # UUID); subsequent calls use --resume to continue it. Both accept stdin
+    # as the prompt body via --print. --output-format json so we can extract
+    # the .result field cleanly and detect errors structurally.
     # so the agent doesn't pause asking for tool-call approvals - matches the
     # interactive sutando-core posture.
     $stderrPath = "$claimedPath.stderr"
-    $result = $prompt | & $CLAUDE --print --dangerously-skip-permissions 2>$stderrPath
+    if ($isNew) {
+        # Create the session with our pre-generated UUID; subsequent turns
+        # will --resume it.
+        $stdout = $prompt | & $CLAUDE --print --output-format json `
+            --session-id $sessionId `
+            --dangerously-skip-permissions 2>$stderrPath
+    } else {
+        $stdout = $prompt | & $CLAUDE --print --output-format json `
+            --resume $sessionId `
+            --dangerously-skip-permissions 2>$stderrPath
+    }
     $exitCode = $LASTEXITCODE
     $stderr = Get-Content -Raw -Path $stderrPath -ErrorAction SilentlyContinue
     Remove-Item -Path $stderrPath -ErrorAction SilentlyContinue
+
+    # Default to whatever claude printed; we override below on parse success.
+    $result = if ($stdout -is [array]) { $stdout -join "`n" } else { [string]$stdout }
 
     if ($exitCode -ne 0) {
         $errMsg = if ($stderr) { $stderr.Trim() } else { "claude exited $exitCode" }
         Log "${taskId}: FAILED (exit=$exitCode): $errMsg"
         $result = "task-dispatcher: claude --print exited $exitCode. stderr:`n$errMsg"
+    } else {
+        # --output-format json emits a single-line JSON object with .result =
+        # the assistant's text and .session_id = the live session UUID. Parse
+        # and unwrap so consumers (web UI, bridges) see just the message.
+        try {
+            $obj = $result | ConvertFrom-Json -ErrorAction Stop
+            if ($obj.is_error) {
+                $errBody = if ($obj.result) { $obj.result } else { 'claude reported is_error=true' }
+                Log "${taskId}: claude reported is_error=true: $errBody"
+                $result = "task-dispatcher: claude error: $errBody"
+            } elseif ($null -ne $obj.result) {
+                $result = [string]$obj.result
+                # Capture the returned session_id - it should match what we
+                # sent. If claude rotated it (rare, but spec-allowed), persist
+                # the new id so the next turn resumes the right thread.
+                if ($obj.session_id -and $obj.session_id -ne $sessionId) {
+                    Log "${taskId}: session id rotated $sessionId -> $($obj.session_id)"
+                    [System.Threading.Monitor]::Enter($sessionLock)
+                    try {
+                        $script:sessions[$channel] = $obj.session_id
+                        Save-SessionMap $script:sessions
+                    } finally {
+                        [System.Threading.Monitor]::Exit($sessionLock)
+                    }
+                }
+            } else {
+                Log "${taskId}: JSON had no .result field, falling through to raw stdout"
+            }
+        } catch {
+            # Not JSON or malformed - keep the raw stdout we already assigned.
+            Log "${taskId}: stdout was not JSON ($_), passing through raw"
+        }
     }
 
     # Write result. Bridges/web UI watch results/task-<id>.txt.

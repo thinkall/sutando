@@ -20,7 +20,8 @@
 param(
     [switch]$SkipPhone,
     [switch]$SkipTelegram,
-    [switch]$SkipCore
+    [switch]$SkipCore,
+    [switch]$SkipDispatcher
 )
 
 $ErrorActionPreference = 'Stop'
@@ -281,6 +282,22 @@ if (-not $SkipCore) {
     Write-Host ""
     Write-Host "  ~ sutando-core skipped (use -SkipCore=$false or run scripts/start-cli.ps1 manually)"
     Write-Host "    Without the core, tasks queue but never run."
+}
+
+# --- Task dispatcher (Windows-only Monitor-equivalent) ----------------------
+# Claude Code 2.x dropped the Monitor tool, so the long-running sutando-core
+# only picks up new tasks on its 5min cron tick - too slow for chat. The
+# dispatcher watches tasks/ and shells out to `claude --print` per new task
+# for sub-5s latency, independent of cron timing. The core still runs the
+# autonomous proactive-loop work; this just handles user-driven chat tasks.
+if (-not $SkipDispatcher) {
+    Write-Host ""
+    Write-Host "Starting task-dispatcher (push-driven chat-task processor)..."
+    & pwsh -NoProfile -File (Join-Path $REPO 'src\task-dispatcher.ps1') -Background
+} else {
+    Write-Host ""
+    Write-Host "  ~ task-dispatcher skipped (use -SkipDispatcher=$false to enable)"
+    Write-Host "    Without it, chat tasks wait up to 1min for the next core cron tick."
 }
 
 Write-Host ""

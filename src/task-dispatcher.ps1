@@ -103,12 +103,18 @@ function Get-TaskPrompt($path) {
 
 # Parse a `key: value` header line from the task body. Returns the trimmed
 # value (or $null). Used to extract channel_id so each surface gets its own
-# resumable claude session.
+# resumable claude session. Stops scanning at the first `task:` line so a
+# multi-line task body whose content includes e.g. `channel_id: forge` can
+# not forge headers - mirrors the TS-side stop-at-task convention from
+# PR #982 (`task-bridge.ts:_isVoiceTask`).
 function Get-TaskHeader($path, $key) {
     $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
     if (-not $content) { return $null }
-    if ($content -match "(?m)^${key}:\s*(.+?)\s*$") {
-        return $Matches[1].Trim()
+    foreach ($line in ($content -split '\r?\n')) {
+        if ($line -match '^task:') { return $null }
+        if ($line -match "^${key}:\s*(.+?)\s*$") {
+            return $Matches[1].Trim()
+        }
     }
     return $null
 }

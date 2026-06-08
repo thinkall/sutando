@@ -71,7 +71,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
 
 ## The numbered loop
 
-1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`.
+1. **Check for tasks.** Look in `tasks/` for voice / Discord / Telegram / phone tasks. Look at `context-drop.txt` for context drops. Process anything found — execute the task, write results to `results/`, then **move the source task file from `tasks/<id>.txt` to `tasks/archive/<id>.txt`** so the next pass doesn't re-emit it. On macOS the long-lived `task-bridge.ts` archives automatically; on Windows the core agent is sometimes the consumer (e.g. dispatcher restarting) and must archive itself, otherwise the watcher's idempotent `$seen` set only suppresses re-emission within one watcher lifetime — a restart re-emits every file still in `tasks/`.
    - **Access control:** If the task has `access_tier: other` or `access_tier: team`, delegate to a sandboxed agent. Do NOT process non-owner tasks with your full capabilities. Write the sandboxed output to results.
    - Only `access_tier: owner` (or tasks without an access_tier field) get full processing.
    - **Thread consolidation:** when several tasks in a short window are the same continuation thought (e.g. voice over-delegating "yes, right, this is useful…" as 3 separate tasks), put the FULL reply in the latest task's result and put `[deduped: task-<latest-id>]` in each earlier task's result. The bridge silently archives the deduped ones — no voice cascade, no DM duplicates. See CLAUDE.md "Result-body protocol markers" for the full marker list.

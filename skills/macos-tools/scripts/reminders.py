@@ -152,8 +152,8 @@ def main():
             print("No reminders.")
             return
         if reminders and "error" in reminders[0]:
-            print(f"Error: {reminders[0]['error']}")
-            return
+            print(f"Error: {reminders[0]['error']}", file=sys.stderr)
+            sys.exit(1)
         for r in reminders:
             done = " [DONE]" if r["completed"] else ""
             due = f" (due {r['due']})" if r["due"] else ""

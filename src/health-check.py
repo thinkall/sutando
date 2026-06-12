@@ -39,6 +39,7 @@ REPO_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
+from sutando_platform import find_pids  # noqa: E402
 
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
@@ -1183,12 +1184,18 @@ def run_all_checks() -> list[dict]:
         try:
             # Anchor on the .py suffix so we don't match unrelated processes
             # whose command line happens to contain "discord-bridge" (shell
-            # invocations, ps/grep pipelines, etc). Otherwise pgrep -f bare
-            # name produces false-positive "multiple processes" warnings
-            # that scared us into thinking the bridges were zombied today.
-            result = subprocess.run(["/usr/bin/pgrep", "-f", f"{proc_name}\\.py$"], capture_output=True, text=True)
-            pids = result.stdout.strip().split("\n") if result.returncode == 0 else []
-            pids = [p for p in pids if p]
+            # invocations, ps/grep pipelines, etc). Otherwise a bare-name match
+            # produces false-positive "multiple processes" warnings that scared
+            # us into thinking the bridges were zombied today.
+            # find_pids() is cross-platform (pgrep on macOS/Linux, Get-CimInstance
+            # on Windows where /usr/bin/pgrep doesn't exist — previously this
+            # raised FileNotFoundError, swallowed below, so every Windows bridge
+            # was reported "not running" even when live).
+            # find_pids() honors the `$` end-anchor on both platforms (pgrep
+            # regex on macOS/Linux; EndsWith on Windows), so the real
+            # `python … src/discord-bridge.py` process matches but transient
+            # shells that merely mention the script mid-command-line don't.
+            pids = find_pids(f"{proc_name}\\.py$")
         except Exception:
             pids = []
 

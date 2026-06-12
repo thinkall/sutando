@@ -125,6 +125,56 @@ def clipboard_write(text: str) -> None:
 
 # ---------- Process listing / killing ----------
 
+def find_pids(pattern: str) -> list[str]:
+    """Return PIDs (as strings) of running processes whose command line matches `pattern`.
+
+    macOS/Linux: `pgrep -f <pattern>` (pattern is a regex, per pgrep).
+    Windows: substring match on CommandLine (case-insensitive) via
+    `Get-CimInstance Win32_Process` — PowerShell has no pgrep. A trailing `$`
+    in the pattern is honored as an end-of-command-line anchor (mirroring
+    pgrep's `$`), and a leading `^` as a start anchor, so one `foo\\.py$`-style
+    pattern means the same thing on both platforms. Regex backslash-escapes
+    (`\\.`) are normalized to plain chars for the Windows literal compare.
+    Never raises; returns [] on any failure.
+    """
+    try:
+        if is_macos() or is_linux():
+            r = subprocess.run(["pgrep", "-f", pattern], timeout=3.0, capture_output=True, text=True, check=False)
+            if r.returncode != 0:
+                return []
+            return [p for p in (r.stdout or "").strip().split("\n") if p]
+        if is_windows():
+            anchor_start = pattern.startswith("^")
+            anchor_end = pattern.endswith("$")
+            core = pattern[1:] if anchor_start else pattern
+            core = core[:-1] if anchor_end else core
+            core = core.replace("\\.", ".").replace("\\", "")  # de-regex for literal compare
+            safe = core.replace("'", "''").lower()
+            if anchor_start and anchor_end:
+                cond = f"$cl -eq '{safe}'"
+            elif anchor_end:
+                cond = f"$cl.EndsWith('{safe}')"
+            elif anchor_start:
+                cond = f"$cl.StartsWith('{safe}')"
+            else:
+                cond = f"$cl.Contains('{safe}')"
+            script = (
+                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | "
+                f"ForEach-Object {{ $cl = $_.CommandLine.ToLower().Trim(); if ({cond}) {{ $_.ProcessId }} }}"
+            )
+            r = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                timeout=5.0,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            return [p for p in (r.stdout or "").strip().split("\n") if p.strip().isdigit()]
+    except Exception:
+        pass
+    return []
+
+
 def is_process_running(pattern: str) -> bool:
     """True iff some running process command line contains `pattern`."""
     try:

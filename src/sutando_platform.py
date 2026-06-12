@@ -158,9 +158,19 @@ def find_pids(pattern: str) -> list[str]:
                 cond = f"$cl.StartsWith('{safe}')"
             else:
                 cond = f"$cl.Contains('{safe}')"
+            # Exclude the helper's own query pipeline: the pattern is interpolated
+            # into this PowerShell command, so for unanchored `.Contains` matches
+            # the powershell process — and any cmd/bash wrapper that carries the
+            # `-Command` text — would self-match. Tag the script with a fixed
+            # sentinel and drop any process whose command line carries it (plus
+            # our own $PID for good measure).
+            sentinel = "__sutando_find_pids__"
             script = (
-                "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | "
-                f"ForEach-Object {{ $cl = $_.CommandLine.ToLower().Trim(); if ({cond}) {{ $_.ProcessId }} }}"
+                f"# {sentinel}\n"
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -and $_.ProcessId -ne $PID } | "
+                "ForEach-Object { $cl = $_.CommandLine.ToLower().Trim(); "
+                f"if ($cl -notlike '*{sentinel}*' -and {cond}) {{ $_.ProcessId }} }}"
             )
             r = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],

@@ -1,0 +1,103 @@
+"""Tests for find_pids() in src/sutando_platform.py.
+
+find_pids underpins health-check's bridge/service detection. On Windows it
+shells to Get-CimInstance (no pgrep); on macOS/Linux it uses pgrep -f. Both
+honor a trailing `$` as an end-of-command-line anchor so a real
+`python …/foo.py` process matches `foo\\.py$` while a shell that merely
+mentions `foo.py` mid-command-line does not.
+
+These tests spawn controlled child processes with identifiable command lines
+(rather than asserting against ambient processes) so they're deterministic on
+any machine. Patterns are chosen to be absent from the test runner's own
+command line to avoid self-matching the harness.
+
+Run: `python tests/find-pids.test.py`  (use `python`, not `python3`, on Windows)
+"""
+import importlib.util
+import os
+import subprocess
+import sys
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location(
+        "sutando_platform", ROOT / "src" / "sutando_platform.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestFindPids(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load()
+        self._procs = []
+
+    def tearDown(self):
+        for p in self._procs:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                pass
+
+    def _spawn_sleeper(self, marker: str):
+        """Spawn a python child that sleeps, with `marker` as a trailing argv
+        token so its command line ENDS with the marker. Returns the Popen."""
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import sys,time; time.sleep(30)", marker],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(p)
+        time.sleep(0.5)  # let it appear in the process table
+        return p
+
+    # A nonsense pattern (absent from any real command line) returns nothing.
+    def test_nonexistent_pattern_returns_empty(self):
+        # This literal is read from here, but the find_pids query tags itself
+        # with a sentinel + skips $PID, so its own probe never self-matches.
+        # The token is unlikely to appear in any other live process.
+        self.assertEqual(self.mod.find_pids("nopE_no_such_proc_7Xq"), [])
+
+    # A spawned child with a unique trailing marker is found by that marker.
+    def test_finds_spawned_child_by_marker(self):
+        marker = "sutando_fp_test_marker_alpha"
+        child = self._spawn_sleeper(marker)
+        pids = self.mod.find_pids(marker)
+        self.assertIn(str(child.pid), pids,
+                      f"spawned child {child.pid} not found via find_pids({marker!r}); got {pids}")
+
+    # The `$` end-anchor matches a child whose command line ENDS with the marker.
+    def test_end_anchor_matches_trailing_marker(self):
+        marker = "sutando_fp_test_marker_beta"
+        child = self._spawn_sleeper(marker)  # marker is the last argv token
+        pids = self.mod.find_pids(marker + "$")
+        self.assertIn(str(child.pid), pids,
+                      f"end-anchored find_pids({marker+'$'!r}) should match trailing marker; got {pids}")
+
+    # The `$` anchor does NOT match when the marker is mid-command-line.
+    def test_end_anchor_rejects_midline_marker(self):
+        marker = "sutando_fp_test_marker_gamma"
+        # marker is NOT the last token — a trailing arg follows it.
+        p = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)", marker, "TRAILER"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        self._procs.append(p)
+        time.sleep(0.5)
+        pids = self.mod.find_pids(marker + "$")
+        self.assertNotIn(str(p.pid), pids,
+                         f"end-anchored find_pids({marker+'$'!r}) must NOT match a mid-line marker; got {pids}")
+        # …but the unanchored form DOES find it.
+        self.assertIn(str(p.pid), self.mod.find_pids(marker))
+
+
+if __name__ == "__main__":
+    unittest.main()

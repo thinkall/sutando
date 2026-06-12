@@ -63,7 +63,7 @@ def _default_memory_dir() -> str:
     only when it is unset (preserving the old path for ad-hoc launches).
     """
     repo = Path(__file__).parent.parent.resolve()
-    slug = str(repo).replace("/", "-")
+    slug = str(repo).replace(":", "-").replace("\\", "-").replace("/", "-")
     return str(Path(claude_home_path()) / "projects" / slug / "memory")
 
 MEMORY_DIR = Path(os.environ.get("SUTANDO_MEMORY_DIR", _default_memory_dir()))

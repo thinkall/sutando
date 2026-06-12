@@ -20,6 +20,7 @@
 param(
     [switch]$SkipPhone,
     [switch]$SkipTelegram,
+    [switch]$SkipDiscord,
     [switch]$SkipCore,
     [switch]$SkipDispatcher
 )
@@ -244,6 +245,25 @@ if (-not $SkipTelegram -and (Test-Path (Join-Path $HOME '.claude\channels\telegr
     }
 } else {
     Write-Host "  ~ telegram bridge (skipped or no token - optional)"
+}
+
+if (-not $SkipDiscord -and (Test-Path (Join-Path $HOME '.claude\channels\discord\.env'))) {
+    $dcEnv = Get-Content (Join-Path $HOME '.claude\channels\discord\.env')
+    if ($dcEnv -match 'DISCORD_BOT_TOKEN=') {
+        $dcArgs = @((Join-Path $REPO 'src\discord-bridge.py'))
+        if ($PY -eq 'py') { $dcArgs = @('-3') + $dcArgs }
+        if (-not (& powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('discord-bridge') } | Select-Object -First 1 ProcessId" | Out-String).Contains('ProcessId')) {
+            Write-Host "  Starting Discord bridge..."
+            Start-Process -FilePath $PY -ArgumentList $dcArgs -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $LOGS_DIR 'discord-bridge.log') `
+                -RedirectStandardError (Join-Path $LOGS_DIR 'discord-bridge.log.err') | Out-Null
+            Write-Host "  + discord bridge"
+        } else {
+            Write-Host "  + discord bridge (already running)"
+        }
+    }
+} else {
+    Write-Host "  ~ discord bridge (skipped or no token - optional)"
 }
 
 if (-not $SkipPhone -and ($env:TWILIO_ACCOUNT_SID)) {

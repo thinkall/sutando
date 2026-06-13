@@ -27,6 +27,17 @@
 param([switch]$Background)
 
 $ErrorActionPreference = 'Continue'
+
+# Force UTF-8 end to end. `claude --print` emits UTF-8 JSON and the Discord/
+# Telegram/Slack bridges read results with Python's UTF-8 default; without
+# this PowerShell decodes the subprocess stdout in the legacy ANSI codepage,
+# so `°`/`—`/`→` arrive at the user as mojibake (`┬░` / `ΓÇö`). Set both the
+# console output encoding (affects how `& $CLAUDE` output is decoded) and the
+# default $OutputEncoding (affects the pipe into claude).
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
+try { [Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false) } catch {}
+
 $REPO = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 # Resolve workspace - matches startup.ps1 / workspace_default.ps1 contract.
@@ -91,27 +102,60 @@ Log "task-dispatcher started. claude=$CLAUDE workspace=$WORKSPACE"
 # Parse the task file body (header lines `key: value` + a `task: <body>` line
 # that may span multiple lines until the next `--- recent voice transcript ---`
 # marker or EOF). Returns the user-facing prompt text.
+#
+# The bridges write metadata headers (source/channel_id/...) AFTER the `task:`
+# line, so the body must terminate at the first trailing header line - otherwise
+# those headers get swallowed into the prompt and the subprocess treats
+# `source: discord` / `access_tier: owner` as part of the user's message and
+# narrates its own internals back at them. Stop at: a known-header line, the
+# `--- recent voice transcript ---` marker, or EOF.
+$script:KNOWN_TASK_HEADERS = @(
+    'id', 'timestamp', 'source', 'channel_id', 'channel_name',
+    'guild_name', 'source_message_id', 'parent_message_id',
+    'user_id', 'access_tier', 'priority'
+)
+$script:HEADER_LINE_RE = '^(?:' + ($script:KNOWN_TASK_HEADERS -join '|') + '):\s'
 function Get-TaskPrompt($path) {
     $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
     if (-not $content) { return $null }
-    # Capture everything after `task: ` until the transcript marker / blank line at EOF.
-    if ($content -match '(?ms)^task:\s*(.+?)(?:\r?\n---|\z)') {
-        return $Matches[1].Trim()
+    $lines = $content -split '\r?\n'
+    $body = [System.Collections.Generic.List[string]]::new()
+    $inBody = $false
+    foreach ($line in $lines) {
+        if (-not $inBody) {
+            if ($line -match '^task:\s*(.*)$') {
+                $inBody = $true
+                if ($Matches[1]) { $body.Add($Matches[1]) }
+            }
+            continue
+        }
+        # End of body: a trailing metadata header or the transcript marker.
+        if ($line -match $script:HEADER_LINE_RE) { break }
+        if ($line -match '^---') { break }
+        $body.Add($line)
     }
+    if ($inBody) { return ($body -join "`n").Trim() }
     return $content.Trim()
 }
 
 # Parse a `key: value` header line from the task body. Returns the trimmed
-# value (or $null). Used to extract channel_id so each surface gets its own
-# resumable claude session. Stops scanning at the first `task:` line so a
-# multi-line task body whose content includes e.g. `channel_id: forge` can
-# not forge headers - mirrors the TS-side stop-at-task convention from
-# PR #982 (`task-bridge.ts:_isVoiceTask`).
+# value (or $null). Used to extract channel_id/source so each surface gets its
+# own resumable claude session and the right conversational framing.
+#
+# The bridges (discord/telegram/slack) and task-bridge.ts all write the `task:`
+# body line BEFORE the metadata headers (`source:`, `channel_id:`, ...). An
+# earlier version stopped scanning at `task:` to block a multi-line body from
+# forging headers - but that also meant the real trailing headers were never
+# read, so every Discord task collapsed onto the default `local` session and
+# lost its `source`. We instead only honor a fixed allowlist of known header
+# keys: a body line can at most spoof one of those, and they carry no authority
+# a message author would want to forge (channel/session routing + framing).
+# ($script:KNOWN_TASK_HEADERS is defined above, shared with Get-TaskPrompt.)
 function Get-TaskHeader($path, $key) {
+    if ($key -notin $script:KNOWN_TASK_HEADERS) { return $null }
     $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
     if (-not $content) { return $null }
     foreach ($line in ($content -split '\r?\n')) {
-        if ($line -match '^task:') { return $null }
         if ($line -match "^${key}:\s*(.+?)\s*$") {
             return $Matches[1].Trim()
         }
@@ -185,6 +229,34 @@ function Process-Task($claimedPath, $taskId) {
     # so voice/discord/telegram each retain their own conversation thread.
     $channel = Get-TaskHeader $claimedPath 'channel_id'
     if (-not $channel) { $channel = 'local' }
+
+    # Frame the prompt so the one-shot subprocess answers the user, not narrates
+    # its own plumbing. Without this the subprocess reads the repo CLAUDE.md
+    # (task-bridge protocol, dispatcher rules) and replies with dispatcher/
+    # session/result-file jargon instead of the user's actual question.
+    $source = Get-TaskHeader $claimedPath 'source'
+    if ($source -in @('discord', 'telegram', 'slack', 'voice', 'chat')) {
+        $surface = switch ($source) {
+            'discord'  { 'a Discord chat' }
+            'telegram' { 'a Telegram chat' }
+            'slack'    { 'a Slack chat' }
+            'voice'    { 'a voice conversation' }
+            default    { 'a chat' }
+        }
+        $preamble = @"
+You are Sutando, the user's personal AI assistant, replying to a real person in $surface. Your entire output is delivered verbatim as your reply to them.
+
+Reply directly and naturally to their message below. Answer the actual question or do the actual task they asked for. Keep it short and conversational - say only what answers the message, in as few sentences as it needs. Don't restate the question, don't pad with preamble or caveats, don't explain your reasoning unless they asked for it.
+
+For current weather, you can run ``curl -s "https://wttr.in/<city>?format=%l:+%C+%t+(feels+%f),+humidity+%h,+wind+%w"`` (URL-encode spaces in the city as +). It needs no API key and works for any city worldwide. Use it instead of saying you lack a weather tool.
+
+Never mention your own internal machinery: do NOT talk about task dispatchers, task IDs, sessions, subprocesses, result files, pipelines, ``claude --print``, processing status, the workspace, git branches, or uncommitted changes. The user does not know or care about any of that. If you genuinely cannot answer, say so plainly in one sentence.
+
+The user's message:
+$prompt
+"@
+        $prompt = $preamble
+    }
 
     [System.Threading.Monitor]::Enter($sessionLock)
     try {
@@ -267,9 +339,11 @@ function Process-Task($claimedPath, $taskId) {
         }
     }
 
-    # Write result. Bridges/web UI watch results/task-<id>.txt.
+    # Write result. Bridges/web UI watch results/task-<id>.txt. UTF-8 without
+    # BOM so the Python bridges (read_text() = UTF-8) get clean bytes and a BOM
+    # doesn't corrupt the first line.
     $resultFile = Join-Path $RESULTS "$taskId.txt"
-    Set-Content -Path $resultFile -Value $result -NoNewline
+    [System.IO.File]::WriteAllText($resultFile, [string]$result, [System.Text.UTF8Encoding]::new($false))
     Log "${taskId}: done -> $resultFile"
 
     # Archive the task file so we don't reprocess it on rescan.

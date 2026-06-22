@@ -1,17 +1,13 @@
 ---
-title: Release process + migration framework — consolidated RFC
-date: 2026-05-19
-tags: [release-process, migration, rfc, plan-only]
+title: Release process + migration framework
+original_rfc_date: 2026-05-19
+tags: [release-process, migration]
 authors: [Sutando-Mini, qingyun-sutando]
-status: draft — open questions resolved 2026-05-20, ready to merge (plan only; nothing implemented)
-related: docs/release-process-proposal-mini.md, docs/release-process-proposal-qingyun-sutando.md, docs/release-process.md (not yet written)
+status: ratified, in effect
+ratified_in: v0.1.0 (engine release infrastructure) + v0.3.0 (workspace migration framework)
 ---
 
-> **Plan-only document.** Merge of both co-authored halves on PR #906:
-> - `docs/release-process-proposal-mini.md` — *when* to cut + tag conventions
-> - `docs/release-process-proposal-qingyun-sutando.md` — *what goes in* + CHANGELOG + migration framework + joint engine↔product coupling
->
-> Both source files are preserved on this branch as the authorship record. This consolidated doc is what owner + Chi review; if greenlit it promotes to `docs/release-process.md`.
+> **Canonical reference for the Sutando release process + workspace migration framework.** Ratified and in-effect since v0.1.0 (release infrastructure) and v0.3.0 (workspace migration framework, M0+M1+M2 + sync-workspace). The original RFC was authored on PR #906; promotion to canonical landed in PR #1472 as part of the v0.3.0 docs sweep. The original draft and the two co-authored halves (`docs/release-process-proposal-mini.md` + `docs/release-process-proposal-qingyun-sutando.md`) are preserved in git history.
 
 ## Overview — what this RFC defines and why
 

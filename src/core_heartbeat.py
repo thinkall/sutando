@@ -44,20 +44,23 @@ import sys
 import time
 from pathlib import Path
 
-# Resolve workspace path with the same precedence as the rest of Sutando.
-# Inlined (not imported) so this script can run before any other Sutando
-# module is loaded — keeps the heartbeat dep-free.
-_workspace_env = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-if _workspace_env:
-    WORKSPACE = Path(_workspace_env).expanduser()
-else:
-    WORKSPACE = Path.home() / ".sutando" / "workspace"
+# Resolve workspace via the M0 helper (PR #1395 / v0.8 #1440) — the previous
+# inlined env-or-legacy-default resolution wrote .alive files where no
+# post-M0 reader looks (health-check + dashboard read resolve_workspace()/
+# state/cores/), so every core reported dead. workspace_default is a sibling
+# module (stdlib-only deps), so the old "dep-free" rationale no longer buys
+# anything. Fail loud on import error: a heartbeat written to the wrong tree
+# is worse than no heartbeat (supervisor restarts on crash; see module header).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workspace_default import resolve_workspace  # noqa: E402
+
+WORKSPACE = resolve_workspace()
 
 CORES_DIR = WORKSPACE / "state" / "cores"
 
 
 def _hostname() -> str:
-    """Short hostname without domain. Mirrors what sync-memory.sh uses for
+    """Short hostname without domain. Mirrors what sync-workspace.sh uses for
     machine-<host>/ dirs, so the .alive file is recognizable across the
     fleet's other state files."""
     return socket.gethostname().split(".")[0]

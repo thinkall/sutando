@@ -99,5 +99,17 @@ voice-state.json
 # Single-instance lock written by src/voice-agent.ts (acquirePidLock).
 .voice-agent.pid
 
+# Per-clone Sutando config overrides — workspace path, vault remote, etc.
+# Tracked defaults live in sutando.config.json; .local.json carries the
+# machine-specific overrides (different workspace location, different vault
+# remote per host) and must never be committed.
+sutando.config.local.json
+
+# In-repo workspace (M0 default). Everything user-runtime — tasks/, results/,
+# state/, notes/, build_log.md, etc. — lives under workspace/ and must never
+# be committed. .gitkeep is the exception so the directory ships in fresh
+# clones for a zero-config first run.
+workspace/*
+!workspace/.gitkeep
 # AG2 onboarding summary — private (invite codes + ids)
 ag2-onboarding.txt

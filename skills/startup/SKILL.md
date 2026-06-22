@@ -36,7 +36,7 @@ The sequence below MUST run in this order. Each step is naturally idempotent, so
 
 ### Step 1 — Task orphan check (optional)
 
-Invoke `/task-orphan-check` IF the skill is installed (i.e. `~/.claude/skills/task-orphan-check/` exists). This is the recovery half of the post-#1049 redesign: scan `<workspace>/tasks/` for orphan tasks left over from a crash mid-execution, cross-reference per-side-effect markers (e.g. PR #1048's `.sending` files), archive completed tasks, write recovery sentinels for stuck ones. See the skill itself for the full procedure.
+Invoke `/task-orphan-check` IF the skill is installed (i.e. `$CLAUDE_CONFIG_DIR/skills/task-orphan-check/` exists). This is the recovery half of the post-#1049 redesign: scan `<workspace>/tasks/` for orphan tasks left over from a crash mid-execution, cross-reference per-side-effect markers (e.g. PR #1048's `.sending` files), archive completed tasks, write recovery sentinels for stuck ones. See the skill itself for the full procedure.
 
 If the skill is not installed, skip silently. `/startup` works without it — every other step is independent.
 

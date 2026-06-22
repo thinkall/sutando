@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
-from util_paths import shared_personal_path  # noqa: E402
+from util_paths import channel_access_path, claude_home_path, shared_personal_path  # noqa: E402
 from task_priority import default_priority_for_source  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from result_markers import parse_markers  # noqa: E402
@@ -174,14 +174,14 @@ except Exception:  # pragma: no cover
 # Load token — env var takes precedence (allows test injection without a real .env file)
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 if not TOKEN:
-    channels_env = Path.home() / ".claude" / "channels" / "discord" / ".env"
+    channels_env = claude_home_path("channels", "discord", ".env")
     if channels_env.exists():
         for line in channels_env.read_text().splitlines():
             if line.startswith("DISCORD_BOT_TOKEN="):
                 TOKEN = line.split("=", 1)[1].strip()
 
 if not TOKEN:
-    print("DISCORD_BOT_TOKEN not set in ~/.claude/channels/discord/.env")
+    print("DISCORD_BOT_TOKEN not set in $CLAUDE_CONFIG_DIR/channels/discord/.env")
     exit(1)
 
 TASKS_DIR = REPO / "tasks"
@@ -605,7 +605,7 @@ seen_message_ids = set()  # Discord message IDs already processed
 
 
 # Load access config
-ACCESS_FILE = Path.home() / ".claude" / "channels" / "discord" / "access.json"
+ACCESS_FILE = channel_access_path("discord")
 def load_allowed():
     try:
         data = json.loads(ACCESS_FILE.read_text())
@@ -3576,15 +3576,36 @@ async def poll_results():
                     if _redirect_action:
                         target_channel_id = int(_redirect_action.value)
                         task_tier = "other"
-                        try:
-                            task_body = (TASKS_DIR / f"{task_id}.txt").read_text()
+                        # The core agent may have already moved the processed
+                        # task out of the live dir before we pick up the result
+                        # (2026-06-10: an owner [channel:] forward was dropped
+                        # because the gate read tier from a path that no longer
+                        # existed and failed safe to "other"). A processed task
+                        # can be in four places — mirror _isVoiceTask's set
+                        # (task-bridge.ts): live, processed/, legacy flat
+                        # archive/, and the active month-partitioned
+                        # archive/YYYY-MM/ (qingyun review, #1710).
+                        _tier_candidates = [
+                            TASKS_DIR / f"{task_id}.txt",
+                            TASKS_DIR / "processed" / f"{task_id}.txt",
+                        ]
+                        if ARCHIVE_TASKS_DIR.is_dir():
+                            _tier_candidates.append(ARCHIVE_TASKS_DIR / f"{task_id}.txt")
+                            _tier_candidates += [
+                                m / f"{task_id}.txt"
+                                for m in sorted(ARCHIVE_TASKS_DIR.iterdir())
+                                if m.is_dir() and re.fullmatch(r"\d{4}-\d{2}", m.name)
+                            ]
+                        for _tier_path in _tier_candidates:
+                            try:
+                                task_body = _tier_path.read_text()
+                            except Exception:
+                                continue
                             for ln in task_body.splitlines():
                                 if ln.startswith("access_tier:"):
                                     task_tier = ln.split(":", 1)[1].strip() or "other"
                                     break
-                        except Exception:
-                            # Missing/unreadable task file → treat as non-owner.
-                            task_tier = "other"
+                            break  # first readable file wins; missing all → "other"
                         if task_tier != "owner":
                             print(
                                 f"  [channel-redirect] dropped — tier '{task_tier}' is not owner "

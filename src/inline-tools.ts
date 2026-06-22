@@ -651,9 +651,9 @@ export const getCoreStatusTool: ToolDefinition = {
 	execution: 'inline',
 	async execute() {
 		try {
-			// core-status.json is per-user runtime state under $SUTANDO_WORKSPACE/state/
-			// (default ~/.sutando/workspace/state/). statusReadPath falls back to the
-			// legacy workspace-root location for one release.
+			// core-status.json is per-user runtime state under <workspace>/state/
+			// (workspace resolves via the M0 helper; default <repo>/workspace/ post-v0.8).
+			// statusReadPath falls back to the legacy workspace-root location for one release.
 			const corePath = statusReadPath('core-status.json', WORKSPACE_DIR);
 			if (!existsSync(corePath)) {
 				return { status: 'idle', description: 'Core agent is not currently running.' };

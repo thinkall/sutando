@@ -26,7 +26,7 @@ bash src/startup.sh
 1. **What happened** — describe the issue clearly
 2. **Steps to reproduce** — numbered steps someone else can follow
 3. **Expected behavior** — what should have happened
-4. **Logs** — paste relevant lines from `$SUTANDO_WORKSPACE/logs/*.log` (defaults to `~/.sutando/workspace/logs/`; the old `<repo>/logs/` path was moved to the workspace per the workspace contract — `src/startup.sh` now writes to `$WORKSPACE/logs/`)
+4. **Logs** — paste relevant lines from `<repo>/workspace/logs/*.log` (the default in-repo workspace; see [`docs/workspace-config.md`](docs/workspace-config.md) for overrides)
 5. **Environment** — macOS version, Node.js version, Claude Code version
 
 **Bonus (highly valued):**

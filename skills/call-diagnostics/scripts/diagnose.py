@@ -35,8 +35,9 @@ METRICS_PATH = _cwd_path if _cwd_path.exists() else _script_path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
 
-# conversation.sqlite lives under the resolved workspace (~/.sutando/workspace),
-# the same tree the runtime writers use — not the repo root.
+# conversation.sqlite lives under the resolved workspace (post-v0.8 default
+# `<repo>/workspace/`; configurable via `sutando.config.local.json`), the same
+# tree the runtime writers use — not the repo root.
 SQLITE_PATH = Path(os.environ.get(
     "SUTANDO_CONVERSATION_DB",
     resolve_workspace(migrate=False) / "data" / "conversation.sqlite"))

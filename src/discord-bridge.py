@@ -422,7 +422,7 @@ def write_owner_activity(channel: str, summary: str) -> None:
         }
         tmp = OWNER_ACTIVITY_FILE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))
-        tmp.rename(OWNER_ACTIVITY_FILE)
+        tmp.replace(OWNER_ACTIVITY_FILE)
     except Exception as e:
         print(f"  [owner-activity] write failed: {e}", flush=True)
 

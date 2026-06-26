@@ -149,16 +149,23 @@ function Get-TaskPrompt($path) {
 # a message author would want to forge (channel/session routing + framing).
 # ($script:KNOWN_TASK_HEADERS is defined above, shared with Get-TaskPrompt.)
 #
-# Header lookups MUST skip the `task:` body region. The body is user-supplied
-# and can be multi-line, so a non-owner sender could put `access_tier: owner`
-# on a second line of their message and forge a trusted field — bypassing the
-# tier guard in Process-Task and running unsandboxed. Producers (discord/slack/
-# telegram bridges) defang such lines via confine_user_content, but that makes
-# the dispatcher's safety depend on every producer remembering to confine; a
-# hand-dropped task file or a future producer that forgets would re-open the
-# hole. So we mirror Get-TaskPrompt's boundary here: once we enter the body at
-# `task:`, ignore every line until the next genuine trailing-header line (or the
-# `---`/fence boundary), and only match the requested key OUTSIDE the body.
+# Header lookups skip the `task:` body region so a benign multi-line body
+# doesn't get mis-read as a trailing header. We mirror Get-TaskPrompt's
+# boundary: once we enter the body at `task:`, ignore every line until the next
+# genuine trailing-header line (or the `---`/fence boundary), and only match the
+# requested key OUTSIDE the body.
+#
+# This is NOT a defense against a forged trusted field. The body boundary is
+# detected by HEADER_LINE_RE, so a forged `access_tier: owner` line ends the
+# body and is then read as a real header (verified: a `task:`+`access_tier: owner`
+# two-liner returns 'owner'). Position alone can't tell a forged trailing header
+# from a real one — real producers write the body first, then `access_tier:`
+# immediately after. The ACTUAL defense is producer-side confine_user_content
+# (src/task_body_guard.py), which U+200B-prefixes any header-shaped user line so
+# it no longer matches `^access_tier:` and is skipped here. An unconfined,
+# hand-dropped task file is out of scope; closing that would need an explicit
+# body fence in the bridges (producer-side protocol change), not a dispatcher
+# heuristic.
 function Get-TaskHeader($path, $key) {
     if ($key -notin $script:KNOWN_TASK_HEADERS) { return $null }
     $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue

@@ -3008,7 +3008,8 @@ async def _handle_discord_message(message, force=False):
     else:
         codex_prompt_text = user_task_text
 
-    prompt_path = f"/tmp/sutando-{task_id}.txt"
+    prompt_dir = "/tmp" if os.name == "posix" else tempfile.gettempdir()
+    prompt_path = f"{prompt_dir}/sutando-{task_id}.txt"
     Path(prompt_path).write_text(codex_prompt_text)
     quoted_task = f'"$(cat {prompt_path})"'
 

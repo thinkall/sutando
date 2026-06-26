@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -483,10 +484,10 @@ def notify_agent_api_task_done(task_id: str, result: str) -> None:
         urllib.request.urlopen(req, timeout=2).read()
     except Exception:
         pass  # best-effort; agent-api will catch up via polling
-INBOX_DIR = Path("/tmp/discord-inbox")
+INBOX_DIR = Path("/tmp/discord-inbox") if os.name == "posix" else Path(tempfile.gettempdir()) / "discord-inbox"
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-INBOX_DIR.mkdir(exist_ok=True)
+INBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _transcribe_via_skill(local_path: str) -> str | None:

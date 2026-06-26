@@ -33,13 +33,20 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Resolve a working Python 3 interpreter. On Windows the bare `python3` on PATH
+# is the Microsoft Store stub (exits 49 without running), so every call below
+# goes through $PYBIN instead. No-op on macOS/Linux where python3 is real.
+# shellcheck source=scripts/python-bin.sh
+. "$REPO_ROOT/scripts/python-bin.sh"
+PYBIN="$(resolve_python_bin)"
+
 cmd="${1:-workspace}"
 
 case "$cmd" in
   workspace)
     # `python3 -c` instead of `-m` so we don't pollute argv[0] with a module
     # path that confuses the loader's exe-anchored repo discovery.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_workspace
@@ -48,7 +55,7 @@ print(resolve_workspace(), end='')
     ;;
 
   vault-enabled)
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -57,7 +64,7 @@ print('true' if resolve_vault().get('enabled') else 'false', end='')
     ;;
 
   vault-url)
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -69,7 +76,7 @@ print(resolve_vault().get('remote_url', ''), end='')
     # PR-3: print sync.include paths one-per-line. Consumed by
     # sync-workspace.sh::_compose_gitignore_content to drive the carrier-set
     # whitelist. Schema in sutando_config.py::resolve_vault.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -82,7 +89,7 @@ for p in resolve_vault().get('sync', {}).get('include', []):
     # PR-3: print sync.exclude paths one-per-line. Explicit denies emitted
     # AFTER the include whitelist (gitignore last-match wins), so user can
     # carve out subpaths from an otherwise-included directory.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_vault
@@ -95,7 +102,7 @@ for p in resolve_vault().get('sync', {}).get('exclude', []):
     # Print migrate.stale_hosts (one per line) — per-clone machine-<host> dirs
     # the legacy import should DROP. Lives in sutando.config.local.json (gitignored,
     # per-clone), NOT .env: this is config, not a secret. Default empty.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -108,7 +115,7 @@ for h in load_config().get('migrate', {}).get('stale_hosts', []):
     # Print migrate.skip_skills (one per line) — per-clone host-only skill names
     # the legacy import should NOT salvage to shared (stale/superseded). Same
     # gitignored per-clone config home as migrate-stale-hosts. Default empty.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import load_config
@@ -123,7 +130,7 @@ for s in load_config().get('migrate', {}).get('skip_skills', []):
     # legacy `claude_sutando_config_dir.subdir` (deprecation-warned) →
     # `<workspace>/.claude-sutando` baked default. `synced=true` entries are
     # validated to be under the workspace at load time.
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_claude_sutando_config_dir
@@ -179,7 +186,7 @@ print(resolve_claude_sutando_config_dir(), end='')
     # Optional second arg picks by id or type; defaults to first type=claude.
     # Example: `bash sutando-config.sh core-config-dir-env-name` → CLAUDE_CONFIG_DIR
     _selector="${2:-claude}"
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -195,7 +202,7 @@ print(entry['env_name'], end='')
     # core_config_dirs entry. Selector semantics identical to
     # core-config-dir-env-name.
     _selector="${2:-claude}"
-    python3 -c "
+    "$PYBIN" -c "
 import sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import find_core_config_dir
@@ -210,7 +217,7 @@ print(entry['value'], end='')
     # v0.9 — print all resolved core_config_dirs entries as JSON (one object
     # per line — JSON Lines). For tooling that wants to enumerate without
     # parsing the full merged config.
-    python3 -c "
+    "$PYBIN" -c "
 import json, sys
 sys.path.insert(0, '$REPO_ROOT')
 from src.sutando_config import resolve_core_config_dirs
@@ -220,7 +227,7 @@ for entry in resolve_core_config_dirs():
     ;;
 
   dump)
-    python3 -m src.sutando_config
+    "$PYBIN" -m src.sutando_config
     ;;
 
   subdirs)

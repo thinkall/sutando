@@ -221,6 +221,28 @@ function Process-Task($claimedPath, $taskId) {
         return
     }
 
+    # Tier guard. Non-owner (team/other) tasks carry a `===SUTANDO SYSTEM
+    # INSTRUCTIONS===` fence the bridge appends AFTER the metadata headers,
+    # telling the consumer to run the task under `codex --sandbox read-only`.
+    # Get-TaskPrompt only returns the `task:` body and discards everything from
+    # the first header onward — so the fence never reaches the prompt. Feeding
+    # the bare body to `claude --print --dangerously-skip-permissions` would run
+    # untrusted content with FULL capabilities, violating CLAUDE.md's "non-owner
+    # tasks MUST be processed via the sandboxed path." The dispatcher has no
+    # sandbox, so the only safe action is to refuse. Owner tier (or a task with
+    # no access_tier — voice/local/older producers) processes normally.
+    $accessTier = Get-TaskHeader $claimedPath 'access_tier'
+    if ($accessTier -and $accessTier -ne 'owner') {
+        Log "${taskId}: refusing non-owner task (access_tier=$accessTier) — dispatcher has no sandbox"
+        $refusal = 'Sandbox unavailable; refusing non-owner task.'
+        $resultFile = Join-Path $RESULTS "$taskId.txt"
+        [System.IO.File]::WriteAllText($resultFile, $refusal, [System.Text.UTF8Encoding]::new($false))
+        $archived = Join-Path $ARCHIVE "$taskId.txt"
+        try { Move-Item -Path $claimedPath -Destination $archived -Force }
+        catch { Remove-Item -Path $claimedPath -ErrorAction SilentlyContinue }
+        return
+    }
+
     # Resolve channel + session. Default channel `local` covers tasks with no
     # channel_id (older test fixtures, ad-hoc producers). Per-channel mapping
     # so voice/discord/telegram each retain their own conversation thread.

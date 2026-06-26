@@ -148,11 +148,33 @@ function Get-TaskPrompt($path) {
 # keys: a body line can at most spoof one of those, and they carry no authority
 # a message author would want to forge (channel/session routing + framing).
 # ($script:KNOWN_TASK_HEADERS is defined above, shared with Get-TaskPrompt.)
+#
+# Header lookups MUST skip the `task:` body region. The body is user-supplied
+# and can be multi-line, so a non-owner sender could put `access_tier: owner`
+# on a second line of their message and forge a trusted field — bypassing the
+# tier guard in Process-Task and running unsandboxed. Producers (discord/slack/
+# telegram bridges) defang such lines via confine_user_content, but that makes
+# the dispatcher's safety depend on every producer remembering to confine; a
+# hand-dropped task file or a future producer that forgets would re-open the
+# hole. So we mirror Get-TaskPrompt's boundary here: once we enter the body at
+# `task:`, ignore every line until the next genuine trailing-header line (or the
+# `---`/fence boundary), and only match the requested key OUTSIDE the body.
 function Get-TaskHeader($path, $key) {
     if ($key -notin $script:KNOWN_TASK_HEADERS) { return $null }
     $content = Get-Content -Raw -Path $path -ErrorAction SilentlyContinue
     if (-not $content) { return $null }
+    $inBody = $false
     foreach ($line in ($content -split '\r?\n')) {
+        if ($inBody) {
+            # Body ends at a trailing metadata header or the transcript/fence
+            # marker; lines before that are user content and never headers.
+            if (($line -match $script:HEADER_LINE_RE) -or ($line -match '^---')) {
+                $inBody = $false
+            } else {
+                continue
+            }
+        }
+        if ($line -match '^task:') { $inBody = $true; continue }
         if ($line -match "^${key}:\s*(.+?)\s*$") {
             return $Matches[1].Trim()
         }

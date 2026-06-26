@@ -1,7 +1,7 @@
 #!/usr/bin/env pwsh
 # Sutando task watcher for Windows - PowerShell twin of src/watch-tasks-stream.sh.
 #
-# Watches $SUTANDO_WORKSPACE/tasks/ and emits "TASK_FILE: <name>" per new file
+# Watches <workspace>/tasks/ and emits "TASK_FILE: <name>" per new file
 # to STDOUT, line-buffered, so the core Claude Code session can stream it via
 # Bash(run_in_background: true) + TaskOutput.
 #
@@ -20,11 +20,8 @@
 [Console]::Out.NewLine = "`n"
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
-if ($env:SUTANDO_WORKSPACE) {
-    $WORKSPACE = $env:SUTANDO_WORKSPACE -replace '^~', $HOME
-} else {
-    $WORKSPACE = Join-Path $HOME '.sutando\workspace'
-}
+. "$PSScriptRoot/workspace_default.ps1"
+$WORKSPACE = Resolve-SutandoWorkspace
 
 $TASKS = Join-Path $WORKSPACE 'tasks'
 New-Item -ItemType Directory -Force -Path $TASKS | Out-Null

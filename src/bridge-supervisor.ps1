@@ -27,11 +27,8 @@ $ErrorActionPreference = 'Continue'
 $REPO = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 # Workspace resolution — matches startup.ps1 / workspace_default contract.
-if ($env:SUTANDO_WORKSPACE) {
-    $WORKSPACE = $env:SUTANDO_WORKSPACE -replace '^~', $HOME
-} else {
-    $WORKSPACE = Join-Path $HOME '.sutando\workspace'
-}
+. "$PSScriptRoot/workspace_default.ps1"
+$WORKSPACE = Resolve-SutandoWorkspace
 $LOGS = Join-Path $WORKSPACE 'logs'
 New-Item -ItemType Directory -Force -Path $LOGS | Out-Null
 $SUPLOG  = Join-Path $LOGS "$Bridge.supervisor.log"

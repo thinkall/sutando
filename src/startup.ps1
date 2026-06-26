@@ -59,11 +59,8 @@ if (-not $env:GEMINI_API_KEY) {
 
 # --- Workspace resolution ----------------------------------------------------
 
-if ($env:SUTANDO_WORKSPACE) {
-    $WORKSPACE = $env:SUTANDO_WORKSPACE -replace '^~', $HOME
-} else {
-    $WORKSPACE = Join-Path $HOME '.sutando\workspace'
-}
+. "$PSScriptRoot/workspace_default.ps1"
+$WORKSPACE = Resolve-SutandoWorkspace
 foreach ($d in 'logs','tasks','results','data','state') {
     New-Item -ItemType Directory -Force -Path (Join-Path $WORKSPACE $d) | Out-Null
 }

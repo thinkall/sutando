@@ -15,11 +15,8 @@ if (-not $Message) {
 $REPO = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 # Resolve workspace - same shape as workspace_default.py
-if ($env:SUTANDO_WORKSPACE) {
-    $WORKSPACE = $env:SUTANDO_WORKSPACE -replace '^~', $HOME
-} else {
-    $WORKSPACE = Join-Path $HOME '.sutando\workspace'
-}
+. "$PSScriptRoot/workspace_default.ps1"
+$WORKSPACE = Resolve-SutandoWorkspace
 
 # 1. Voice agent (proactive message) - if voice agent is up, drop a file under
 #    results/ so the next poll picks it up.

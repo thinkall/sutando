@@ -41,11 +41,8 @@ try { [Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false) } catc
 $REPO = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 # Resolve workspace - matches startup.ps1 / workspace_default.ps1 contract.
-if ($env:SUTANDO_WORKSPACE) {
-    $WORKSPACE = $env:SUTANDO_WORKSPACE -replace '^~', $HOME
-} else {
-    $WORKSPACE = Join-Path $HOME '.sutando\workspace'
-}
+. "$PSScriptRoot/workspace_default.ps1"
+$WORKSPACE = Resolve-SutandoWorkspace
 $TASKS    = Join-Path $WORKSPACE 'tasks'
 $RESULTS  = Join-Path $WORKSPACE 'results'
 $ARCHIVE  = Join-Path $TASKS 'archive'

@@ -331,6 +331,7 @@ try {
 			}
 		}
 	}
+} catch { /* no zoom */ }
 
 // Write the initial voice-mode sentinel AFTER the Zoom auto-detect — so
 // the on-disk state matches the in-memory `meetingActive` decision (was

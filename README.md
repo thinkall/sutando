@@ -198,7 +198,7 @@ Copy-Item .env.example .env
 pwsh -File src/startup.ps1
 
 # Stop everything
-pwsh -File src/restart.ps1 -StopOnly
+pwsh -File src/stop.ps1
 
 # Restart
 pwsh -File src/restart.ps1
@@ -207,6 +207,7 @@ pwsh -File src/restart.ps1
 The Windows scripts mirror their `.sh` twins:
 - `src/startup.ps1` — launches voice agent + web client + dashboard + agent API + screen capture (+ optional bridges)
 - `src/restart.ps1` — stops everything, then starts (matches `restart.sh`)
+- `src/stop.ps1` — stops everything without restarting (matches `stop.sh`; shortcut for `restart.ps1 -StopOnly`)
 - `src/notify.ps1 "msg"` — desktop notification + Discord DM (matches `notify.sh`)
 - `src/watch-tasks-stream.ps1` — task-folder watcher; emits `TASK_FILE: …` per new file
 

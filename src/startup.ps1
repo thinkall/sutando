@@ -249,7 +249,7 @@ if (-not $SkipDiscord -and (Test-Path (Join-Path $HOME '.claude\channels\discord
     if ($dcEnv -match 'DISCORD_BOT_TOKEN=') {
         $dcArgs = @((Join-Path $REPO 'src\discord-bridge.py'))
         if ($PY -eq 'py') { $dcArgs = @('-3') + $dcArgs }
-        if (-not (& powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('discord-bridge') } | Select-Object -First 1 ProcessId" | Out-String).Contains('ProcessId')) {
+        if (-not (& powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe' or name='python3.exe'\" | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('discord-bridge') } | Select-Object -First 1 ProcessId" | Out-String).Contains('ProcessId')) {
             Write-Host "  Starting Discord bridge..."
             Start-Process -FilePath $PY -ArgumentList $dcArgs -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $LOGS_DIR 'discord-bridge.log') `

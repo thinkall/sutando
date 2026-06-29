@@ -37,7 +37,7 @@ import { clearActiveArtifact } from './artifact-cache-tools.js';
 import { injectText } from './browser-tools.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir, tmpdir } from 'node:os';
+import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { VoiceSession } from 'bodhi-realtime-agent';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 // Soft platform check — the voice agent itself is cross-platform (it just
@@ -1255,7 +1255,7 @@ async function main() {
 	}, () => session.clientConnected);
 
 	let lastLoggedIndex = 0;
-	const liveTranscriptPath = join(tmpdir(), 'sutando-live-transcript-voice.txt');
+	const liveTranscriptPath = VOICE_TRANSCRIPT_PATH;
 	try { writeFileSync(liveTranscriptPath, `--- Live Transcript: ${new Date().toISOString()} ---\n\n`); } catch {}
 	session.eventBus.subscribe('turn.end', () => {
 		const items = session.conversationContext.items;

@@ -17,12 +17,12 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
 import { join, extname, dirname, delimiter } from 'node:path';
-import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath, statusReadPath } from './workspace_default.js';
 import { isMacOS, isWindows, clipboardRead, clipboardWrite, notify as platformNotify, macOSOnlyError, openWithDefault } from './platform.js';
+import { PLAYBACK_PATH } from './tmp-paths.js';
 
 // Tasks/, results/, state/, dynamic-content.json are per-user runtime state
 // — live under $SUTANDO_WORKSPACE. Pre-fix, sites below resolved against
@@ -150,7 +150,7 @@ export const openFileTool: ToolDefinition = {
 			if (['.mp4', '.mov', '.webm', '.m4v'].includes(ext)) {
 				try {
 					const fs = await import('node:fs');
-					fs.writeFileSync(join(tmpdir(), 'sutando-playback-path'), filePath);
+					fs.writeFileSync(PLAYBACK_PATH, filePath);
 					console.log(`${ts()} [OpenFile] wrote playback-path for video-control tools`);
 				} catch {}
 			}

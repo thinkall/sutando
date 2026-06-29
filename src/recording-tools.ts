@@ -9,6 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readFileSync, readlinkSync, existsSync, statSync } from 'node:fs';
 import { z } from 'zod';
+import { PLAYBACK_PATH, VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollPausedRef } from './recording-state.js';
 import { isMacOS, macOSOnlyError } from './platform.js';
@@ -95,7 +96,6 @@ export function isRecordingMuted(): boolean {
 // Symlink points to the active call's transcript (phone or voice agent)
 const LIVE_TRANSCRIPT_SYMLINK = '/tmp/sutando-live-transcript.txt';
 const LIVE_TRANSCRIPT_SRT_PATH = '/tmp/sutando-live-transcript-subtitle.srt';
-const VOICE_TRANSCRIPT_PATH = '/tmp/sutando-live-transcript-voice.txt';
 let liveTranscriptRecordingStart = 0;
 let liveTranscriptBaselineLines = 0;
 
@@ -410,7 +410,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const subtitledPath = recordingPath ? recordingPath.replace('.mov', '-narrated-subtitled.mov') : '';
 			// Set subtitle baseline — pick whichever transcript was updated more recently.
 			// Voice agent writes to -voice.txt; phone conversation-server writes to -CA{sid}.txt via symlink.
-			const voiceTranscript = '/tmp/sutando-live-transcript-voice.txt';
+			const voiceTranscript = VOICE_TRANSCRIPT_PATH;
 			let phoneTranscript = '';
 			try { phoneTranscript = readlinkSync(LIVE_TRANSCRIPT_SYMLINK); } catch {}
 			if (existsSync(voiceTranscript) && phoneTranscript && existsSync(phoneTranscript)) {
@@ -475,7 +475,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 				// (no longer falls back to findRecording).
 				const recommended = subtitledPath || (narrated && isReadableFile(narrated) ? narrated : (stopResult?.path || ''));
 				if (recommended) {
-					try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+					try { writeFileSync(PLAYBACK_PATH, recommended); } catch {}
 				}
 				if (liveTranscriptRecordingStart === myRecStart) liveTranscriptRecordingStart = 0;
 				demoStateRef.value = 'done';
@@ -514,7 +514,7 @@ export const scrollAndDescribeTool: ToolDefinition = {
 /** Helper: start QuickTime playback + stream audio to phone */
 async function startPlayback(seekSec: number = 0): Promise<{ status: string; path?: string; error?: string; instruction?: string }> {
 	let recPath: string | null = null;
-	try { recPath = readFileSync('/tmp/sutando-playback-path', 'utf8').trim() || null; } catch {}
+	try { recPath = readFileSync(PLAYBACK_PATH, 'utf8').trim() || null; } catch {}
 	if (!recPath) recPath = findRecording();
 	if (!recPath) return { status: 'error', error: 'No video to play. Open a video first with open_video.' };
 	let alreadyOpen = false;
@@ -650,7 +650,7 @@ export const closeVideoTool: ToolDefinition = {
 		console.log(`${ts()} [CloseVideo] called`);
 		try { execFileSync('/usr/bin/osascript', ['-e', 'tell application "QuickTime Player"', '-e', 'activate', '-e', 'end tell', '-e', 'delay 0.3', '-e', 'tell application "System Events" to keystroke "w" using command down'], { timeout: 5_000 }); } catch {}
 		try { unlinkSync('/tmp/sutando-playback-pause'); } catch {}
-		try { unlinkSync('/tmp/sutando-playback-path'); } catch {}
+		try { unlinkSync(PLAYBACK_PATH); } catch {}
 		return { status: 'closed' };
 	},
 };
@@ -717,7 +717,7 @@ export const screenRecordTool: ToolDefinition = {
 							// depending on open_file (which is now generic / not recording-specific).
 							const recommended = burnedSubtitled || (isReadableFile(narrated) ? narrated : stopParsed.path);
 							if (recommended) {
-								try { writeFileSync('/tmp/sutando-playback-path', recommended); } catch {}
+								try { writeFileSync(PLAYBACK_PATH, recommended); } catch {}
 							}
 						}
 					} catch {}
@@ -750,7 +750,7 @@ export const screenRecordTool: ToolDefinition = {
 					// Persist playback-path so play_video can find this recording without
 					// depending on open_file (which is now generic / not recording-specific).
 					if (files.recommended) {
-						try { writeFileSync('/tmp/sutando-playback-path', files.recommended); } catch {}
+						try { writeFileSync(PLAYBACK_PATH, files.recommended); } catch {}
 					}
 					// Probe duration once here so open_file (now generic) doesn't need to.
 					try {

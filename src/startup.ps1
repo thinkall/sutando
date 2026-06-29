@@ -116,6 +116,18 @@ function Test-Port($port) {
     return [bool]$r
 }
 
+# Detect a running bridge by command-line substring, in-process. The old
+# approach spawned `& powershell -Command "Get-CimInstance ..."` which, under
+# $ErrorActionPreference='Stop', threw NativeCommandExitException whenever the
+# child exited non-zero (e.g. no match). Query CIM directly and swallow errors.
+function Test-BridgeRunning($needle) {
+    try {
+        return [bool](Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($needle) } |
+            Select-Object -First 1)
+    } catch { return $false }
+}
+
 function Start-Service-Bg($name, $port, $cmd, $arglist, $logFile) {
     if (Test-Port $port) {
         Write-Host "  + $name (port $port, already running)"
@@ -237,7 +249,7 @@ if (-not $SkipTelegram -and (Test-Path (Join-Path $HOME '.claude\channels\telegr
     if ($tgEnv -match 'TELEGRAM_BOT_TOKEN=') {
         $tgArgs = @((Join-Path $REPO 'src\telegram-bridge.py'))
         if ($PY -eq 'py') { $tgArgs = @('-3') + $tgArgs }
-        if (-not (& powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('telegram-bridge') } | Select-Object -First 1 ProcessId" | Out-String).Contains('ProcessId')) {
+        if (-not (Test-BridgeRunning 'telegram-bridge')) {
             Write-Host "  Starting Telegram bridge..."
             Start-Process -FilePath $PY -ArgumentList $tgArgs -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $LOGS_DIR 'telegram-bridge.log') `
@@ -256,7 +268,7 @@ if (-not $SkipDiscord -and (Test-Path (Join-Path $HOME '.claude\channels\discord
     if ($dcEnv -match 'DISCORD_BOT_TOKEN=') {
         $dcArgs = @((Join-Path $REPO 'src\discord-bridge.py'))
         if ($PY -eq 'py') { $dcArgs = @('-3') + $dcArgs }
-        if (-not (& powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"name='python.exe' or name='python3.exe'\" | Where-Object { `$_.CommandLine -and `$_.CommandLine.Contains('discord-bridge') } | Select-Object -First 1 ProcessId" | Out-String).Contains('ProcessId')) {
+        if (-not (Test-BridgeRunning 'discord-bridge')) {
             Write-Host "  Starting Discord bridge..."
             Start-Process -FilePath $PY -ArgumentList $dcArgs -WindowStyle Hidden `
                 -RedirectStandardOutput (Join-Path $LOGS_DIR 'discord-bridge.log') `

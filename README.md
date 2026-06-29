@@ -218,7 +218,7 @@ The Windows scripts mirror their `.sh` twins:
 - Python 3.11+ from [python.org](https://python.org) (used by the dashboard, agent API, and bridges)
 - Claude Code installed and logged in (`claude` once)
 
-**Workspace:** identical contract as macOS — defaults to `%USERPROFILE%\.sutando\workspace\` unless `SUTANDO_WORKSPACE` is set in `.env`.
+**Workspace:** identical contract as macOS — defaults to `<repo>/workspace/`; override via `sutando.config.local.json` (see [docs/workspace-config.md](docs/workspace-config.md)).
 
 **What's not ported (and why):**
 - **Sutando.app menu bar** — Swift / AppKit, no Windows equivalent. The global ⌃C / ⌃V / ⌃M shortcuts aren't available; use the web client UI instead.

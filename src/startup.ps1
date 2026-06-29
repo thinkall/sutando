@@ -83,7 +83,12 @@ function Test-Tool($name, $hint) {
 
 if (-not (Test-Tool 'node' 'install Node.js 22+ from https://nodejs.org')) { $missing = 1 }
 if (-not (Test-Tool 'npx' 'comes with node')) { $missing = 1 }
-if (-not (Test-Tool 'python' 'install Python 3.11+ from https://python.org')) { $missing = 1 }
+# Accept either a `python` on PATH or the `py` launcher — python.org installs
+# without "add to PATH" only expose `py`, and Get-PythonCmd falls back to it.
+if (-not ((Get-Command python -ErrorAction SilentlyContinue) -or (Get-Command py -ErrorAction SilentlyContinue))) {
+    Write-Host "  X python not found - install Python 3.11+ from https://python.org"
+    $missing = 1
+}
 if (-not (Test-Tool 'claude' 'install Claude Code: https://docs.anthropic.com/en/docs/claude-code/getting-started')) { $missing = 1 }
 
 if ($missing -eq 1) {
@@ -178,8 +183,10 @@ function Start-Service-Bg($name, $port, $cmd, $arglist, $logFile) {
 # Microsoft Store launcher; `py -3` is the canonical launcher for installed
 # CPython. Prefer `python` only if it runs Python 3 directly.
 function Get-PythonCmd {
-    $pyVer = (& python -c "import sys; print(sys.version_info[0])" 2>$null)
-    if ($pyVer -eq '3') { return 'python' }
+    if (Get-Command python -ErrorAction SilentlyContinue) {
+        $pyVer = (& python -c "import sys; print(sys.version_info[0])" 2>$null)
+        if ($pyVer -eq '3') { return 'python' }
+    }
     if (Get-Command py -ErrorAction SilentlyContinue) { return 'py' }
     return 'python'
 }

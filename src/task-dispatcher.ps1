@@ -82,12 +82,14 @@ function Log($msg) {
     Add-Content -Path $LOGFILE -Value $line
 }
 
-# Locate claude.exe once.
-$claudeCmd = Get-Command claude -All -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.ToLower().EndsWith('.exe') } |
-    Select-Object -First 1
+# Locate claude once. On Windows `claude` is often a .cmd / .ps1 shim rather
+# than a direct .exe (npm/PowerShell install) — accept either, mirroring
+# scripts/start-cli.ps1. Prefer a real .exe when present, else take the shim.
+$claudeAll = Get-Command claude -All -ErrorAction SilentlyContinue
+$claudeCmd = ($claudeAll | Where-Object { $_.Path -and $_.Path.ToLower().EndsWith('.exe') } | Select-Object -First 1)
+if (-not $claudeCmd) { $claudeCmd = ($claudeAll | Select-Object -First 1) }
 if (-not $claudeCmd) {
-    Log "ERROR: claude.exe not found on PATH. Install Claude Code and retry."
+    Log "ERROR: claude not found on PATH. Install Claude Code and retry."
     Remove-Item $pidFile -ErrorAction SilentlyContinue
     exit 1
 }

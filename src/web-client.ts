@@ -1041,12 +1041,9 @@ document.addEventListener('visibilitychange', () => {
 // Page-level AudioContext is for tool cues ONLY — the voice audio graph
 // (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
-// Play a short, low-volume Web Audio blip to signal a tool/core invocation
-// (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
-// gesture, so it's already running during a voice session. Pitch/shape differ
-// by kind so the user can tell a cloud research lookup from a local-core
-// handoff by ear alone. Fire-and-forget: never blocks or gates the tool call.
+// Tool cues are broadcast to every page; only an open voice session owns playback.
 function playToolCue(kind) {
+  if (!connected || !voice || !voice.connected) return;
   try {
     if (!audioCtx) { try { audioCtx = new AudioContext(); } catch (e) { return; } }
     if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }

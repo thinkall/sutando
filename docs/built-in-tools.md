@@ -2,6 +2,11 @@
 
 Reference for the bash/CLI tools every Sutando session can call directly. Linked from `CLAUDE.md` to keep the per-session context budget small — open this file when you need to know what's available rather than carrying it on every turn.
 
+**Voice tool sounds** — during an active browser voice call, short tones signal
+tool use: two rising notes for research, a low note for a core handoff, and a
+short tick for other tools. Idle, connecting, and disconnected web UI tabs stay
+silent. Muting the microphone keeps playback, including these cues, enabled.
+
 **Calendar** — read Google Calendar events via `gws calendar`:
 ```bash
 gws calendar +agenda --today            # today's events (table format by default)

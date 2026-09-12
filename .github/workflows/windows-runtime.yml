@@ -274,6 +274,8 @@ jobs:
       - name: Run Windows TypeScript integrations
         shell: pwsh
         run: |
+          .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\web-tool-cue-session.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'web-tool-cue-session.test.ts failed' }
           .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\task-bridge-result-scan-error.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'task-bridge-result-scan-error.test.ts failed' }
           .\node_modules\.bin\tsx.cmd --test --test-force-exit tests\voice-agent-crash-only.test.ts

@@ -17,6 +17,7 @@ type Session = {
 	voice: { connected: boolean } | null;
 	contextState?: 'running' | 'suspended';
 	muted?: boolean;
+	cueAudio?: boolean;
 };
 
 function harness(session: Session) {
@@ -58,16 +59,19 @@ function harness(session: Session) {
 	const audioCtx = session.contextState ? new FakeAudioContext() : null;
 	if (audioCtx) audioCtx.state = session.contextState!;
 	counts.contextsCreated = 0;
-	new Function('AudioContext', 'EventSource', 'session', 'initialAudioCtx', `
+	const fakeWindow = { location: { search: session.cueAudio ? '?toolCues=sound' : '' } };
+	const fakeLocalStorage = { getItem: (key: string) => key === 'sutando.toolCueAudio' && session.cueAudio ? '1' : null };
+	new Function('AudioContext', 'EventSource', 'session', 'initialAudioCtx', 'window', 'localStorage', `
 		let connected = session.connected;
 		let voice = session.voice;
 		let muted = session.muted || false;
 		let audioCtx = initialAudioCtx;
 		let _sseSource = null;
+		${pageFunction('toolCueSoundsEnabled')}
 		${pageFunction('playToolCue')}
 		${pageFunction('initRemoteToggle')}
 		initRemoteToggle();
-	`)(FakeAudioContext, FakeEventSource, session, audioCtx);
+	`)(FakeAudioContext, FakeEventSource, session, audioCtx, fakeWindow, fakeLocalStorage);
 	return {
 		counts,
 		tones,
@@ -104,17 +108,26 @@ const activeCases: [string, number[]][] = [
 	['work', [500]],
 ];
 
-for (const [kind, expected] of activeCases) {
-	test(`an active voice call preserves the ${kind} cue`, () => {
+for (const [kind] of activeCases) {
+	test(`an active voice call keeps the ${kind} cue silent by default`, () => {
 		const h = harness({ connected: true, voice: { connected: true }, contextState: 'running' });
+		h.cue(kind);
+		assert.deepEqual(h.tones, []);
+		assert.equal(h.counts.contextsCreated, 0, 'silent default must not create a cue context');
+	});
+}
+
+for (const [kind, expected] of activeCases) {
+	test(`an active voice call can opt into the ${kind} cue`, () => {
+		const h = harness({ connected: true, voice: { connected: true }, contextState: 'running', cueAudio: true });
 		h.cue(kind);
 		assert.deepEqual(h.tones, expected);
 		assert.equal(h.counts.contextsCreated, 0, 'the active call reuses its cue context');
 	});
 }
 
-test('microphone mute preserves output cues for an active voice call', () => {
-	const h = harness({ connected: true, voice: { connected: true }, contextState: 'running', muted: true });
+test('microphone mute preserves opted-in output cues for an active voice call', () => {
+	const h = harness({ connected: true, voice: { connected: true }, contextState: 'running', muted: true, cueAudio: true });
 	h.cue('work');
 	assert.deepEqual(h.tones, [500]);
 });

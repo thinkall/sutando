@@ -5,7 +5,6 @@ import {
 	downsample,
 	float32ToInt16,
 	int16ToFloat32,
-	smoothPcmSeam,
 	classifyMicError,
 	classifyMicErrorCode,
 	describeAgentFailure,
@@ -90,36 +89,6 @@ describe('web-voice-transport DSP', () => {
 
 	it('int16ToFloat32: empty buffer → empty array (playChunk guard)', () => {
 		assert.equal(int16ToFloat32(new ArrayBuffer(0)).length, 0);
-	});
-
-	it('continuous speech packets retain their samples at a nonzero seam', () => {
-		const wave = Float32Array.from({ length: 960 }, (_, i) =>
-			0.6 * Math.sin(2 * Math.PI * 220 * i / 24000));
-		const next = wave.slice(480);
-		smoothPcmSeam(next, wave[479], wave[479] - wave[478], 24000);
-		for (let i = 0; i < next.length; i++) {
-			assert.ok(Math.abs(next[i] - wave[480 + i]) < 1e-7, `sample ${i} unchanged`);
-		}
-	});
-
-	it('a discontinuous splice is corrected over 2ms without changing later speech', () => {
-		const next = new Float32Array(240).fill(-0.6);
-		smoothPcmSeam(next, 0.6, 0, 24000);
-		assert.ok(Math.abs(next[0] - 0.6) < 1e-6);
-		assert.ok(Math.abs(next[47] + 0.6) < 1e-6);
-		assert.ok(Math.abs(next[48] + 0.6) < 1e-6);
-		for (let i = 1; i < 49; i++) {
-			assert.ok(Math.abs(next[i] - next[i - 1]) < 0.03, `sample ${i} has no click-sized step`);
-		}
-	});
-
-	it('a fresh onset leaves PCM for the output envelope and short packets remain finite', () => {
-		for (const length of [0, 1, 2, 8, 48]) {
-			const next = new Float32Array(length).fill(0.6);
-			smoothPcmSeam(next, null, 0, 24000);
-			assert.ok(next.every(Number.isFinite));
-			assert.ok(next.every((sample) => Math.abs(sample - 0.6) < 1e-6));
-		}
 	});
 });
 
@@ -309,24 +278,6 @@ class FakeMediaStream {
 	}
 }
 
-class FakeAudioParam {
-	value = 0;
-	events: Array<{ kind: string; when: number; value: number }> = [];
-	setValueAtTime(value: number, when: number): void {
-		this.events.push({ kind: 'set', when, value });
-	}
-	linearRampToValueAtTime(value: number, when: number): void {
-		this.events.push({ kind: 'ramp', when, value });
-	}
-	cancelScheduledValues(when: number): void {
-		this.events = this.events.filter((event) => event.when < when);
-	}
-	cancelAndHoldAtTime(when: number): void {
-		this.cancelScheduledValues(when);
-		this.events.push({ kind: 'hold', when, value: this.value });
-	}
-}
-
 class FakeAudioContext {
 	static created: FakeAudioContext[] = [];
 	/** State the NEXT constructed context starts in ('running' | 'suspended'). */
@@ -340,7 +291,6 @@ class FakeAudioContext {
 	currentTime = 0;
 	destination = {};
 	bufferSourcesStarted = 0;
-	gainParams: FakeAudioParam[] = [];
 
 	constructor() {
 		this.state = FakeAudioContext.nextState;
@@ -361,35 +311,23 @@ class FakeAudioContext {
 		return { onaudioprocess: null, connect() {}, disconnect() {} };
 	}
 	createGain(): any {
-		const gain = new FakeAudioParam();
-		this.gainParams.push(gain);
-		return { gain, connect() {} };
-	}
-	createDynamicsCompressor(): any {
-		return {
-			threshold: { value: 0 }, knee: { value: 0 }, ratio: { value: 0 },
-			attack: { value: 0 }, release: { value: 0 }, connect() {},
-		};
+		return { gain: { value: 0 }, connect() {} };
 	}
 	createAnalyser(): any {
 		return { fftSize: 0, connect() {} };
 	}
 	createBuffer(_ch: number, len: number, rate: number): any {
-		const samples = new Float32Array(len);
-		return { duration: len / rate, getChannelData: () => samples };
+		return { duration: len / rate, getChannelData: () => new Float32Array(len) };
 	}
 	createBufferSource(): any {
 		const src = {
 			buffer: null,
 			playbackRate: { value: 1 },
 			connect() {},
-			startTime: null as number | null,
-			stopTime: null as number | null,
-			start: (when: number) => {
-				src.startTime = when;
+			start: () => {
 				this.bufferSourcesStarted++;
 			},
-			stop: (when?: number) => { src.stopTime = when ?? this.currentTime; },
+			stop() {},
 			onended: null as (() => void) | null,
 		};
 		this.bufferSources.push(src);
@@ -1461,48 +1399,6 @@ function frame(samples: Float32Array): FrameEvent {
 }
 const LOUD = new Float32Array(2048).fill(0.1); // rms 0.1 ≥ 0.02 floor
 const QUIET = new Float32Array(2048); // zeros
-
-describe('voice playback seam smoothing', () => {
-	it('smooths a real splice while keeping queued playback gapless', async () => {
-		const h = harness();
-		const s = await goLive(h);
-		const ctx = FakeAudioContext.created[0];
-		s.binary(new Int16Array(240).fill(19660).buffer);
-		s.binary(new Int16Array(240).fill(-19660).buffer);
-		const first = ctx.bufferSources[0] as any;
-		const second = ctx.bufferSources[1] as any;
-		const firstPcm = first.buffer.getChannelData(0) as Float32Array;
-		const secondPcm = second.buffer.getChannelData(0) as Float32Array;
-		assert.ok(Math.abs(firstPcm[239] - secondPcm[0]) < 0.01);
-		assert.ok(Math.abs(secondPcm[47] + 0.6) < 0.01);
-		assert.ok(Math.abs(second.startTime - (first.startTime + 240 / 24000)) < 1e-9);
-		const envelope = (h.t as any).playbackEnvelope.gain as FakeAudioParam;
-		const releases = envelope.events.filter((event) => event.kind === 'ramp' && event.value === 0);
-		assert.equal(releases.length, 1, 'the first packet tail fade was cancelled');
-		assert.ok(Math.abs(releases[0].when - (second.startTime + 240 / 24000)) < 1e-9);
-		h.t.disconnect();
-	});
-
-	it('an underrun and interruption start a new onset from silence', async () => {
-		const h = harness();
-		const s = await goLive(h);
-		const ctx = FakeAudioContext.created[0];
-		s.binary(new Int16Array(240).fill(19660).buffer);
-		ctx.currentTime = 1;
-		s.binary(new Int16Array(240).fill(19660).buffer);
-		const afterGapStart = (ctx.bufferSources[1] as any).startTime as number;
-		const envelope = (h.t as any).playbackEnvelope.gain as FakeAudioParam;
-		assert.ok(envelope.events.some((event) =>
-			event.kind === 'set' && event.value === 0 && Math.abs(event.when - afterGapStart) < 1e-9));
-		feed(h.t, { type: 'turn.interrupted' });
-		assert.ok(Math.abs((ctx.bufferSources[1] as any).stopTime - 1.002) < 1e-9);
-		s.binary(new Int16Array(240).fill(19660).buffer);
-		const afterInterruptStart = (ctx.bufferSources[2] as any).startTime as number;
-		assert.ok(envelope.events.some((event) =>
-			event.kind === 'set' && event.value === 0 && Math.abs(event.when - afterInterruptStart) < 1e-9));
-		h.t.disconnect();
-	});
-});
 
 function proc(h: ReturnType<typeof harness>): (e: FrameEvent) => void {
 	const p = (h.t as any).processor;

@@ -509,38 +509,6 @@ export const SPEECH_OFFSET_HANG_MS = 600;
  *  max(3× expected callback interval, this) while unmuted + connected. */
 export const CAP_STALL_FLOOR_MS = 1000;
 
-/** Output trim. ~2dB of headroom for downstream audio effects. */
-const PLAYBACK_GAIN = 0.8;
-
-/** Cushion when the playback clock has fallen behind `currentTime`. Chunks are
- *  scheduled from the main thread, so page activity delays delivery; too small
- *  a cushion re-anchors into the next stall and clicks at every seam. */
-const PLAYBACK_REANCHOR_S = 0.2;
-const PLAYBACK_EDGE_FADE_S = 0.002;
-
-/** Correct only abrupt PCM splice errors. Continuous packets keep their
- * samples unchanged; fading every packet would add a volume pulse at the
- * packet rate. The short correction decays to the original waveform. */
-export function smoothPcmSeam(
-  samples: Float32Array,
-  previousSample: number | null,
-  previousSlope: number,
-  sampleRate: number,
-): void {
-  if (samples.length === 0 || previousSample === null) return;
-  const expected = previousSample + previousSlope;
-  const correction = expected - samples[0];
-  const firstSlope = samples.length > 1 ? samples[1] - samples[0] : 0;
-  const nextSlope = samples.length > 2 ? samples[2] - samples[1] : firstSlope;
-  const naturalStep = Math.max(Math.abs(previousSlope), Math.abs(firstSlope), Math.abs(nextSlope));
-  if (Math.abs(correction) <= Math.max(0.04, naturalStep * 4)) return;
-  const frames = Math.min(samples.length, Math.max(2, Math.round(sampleRate * 0.002)));
-  for (let i = 0; i < frames; i++) {
-    const weight = (frames - 1 - i) / Math.max(1, frames - 1);
-    samples[i] = Math.max(-1, Math.min(1, samples[i] + correction * weight));
-  }
-}
-
 /** Egress backpressure watermark: above this bufferedAmount, capture frames
  *  are skipped (visible in `sendSkipped`) instead of piling more PCM onto a
  *  stalled socket (FE-1). */
@@ -639,11 +607,6 @@ export class VoiceTransport {
    *  stop() fires `onended` too, and cancellation is not completion (D7.1). */
   private activeSources: Array<{ src: AudioBufferSourceNode; cancelled: boolean }> = [];
   private nextPlayTime = 0;
-  private playbackEnvelope: GainNode | null = null;
-  private playbackReleaseStart = 0;
-  private playbackReleaseEnd = 0;
-  private lastPlaybackSample: number | null = null;
-  private lastPlaybackSlope = 0;
 
   private bytesSent = 0;
   private bytesRecv = 0;
@@ -847,7 +810,7 @@ export class VoiceTransport {
     // must not let the old session's scheduled playback keep speaking into
     // the new attempt — and nextPlayTime must restart from the new clock
     // instead of continuing the old session's schedule.
-    this.flushPlayback(true);
+    this.flushPlayback();
     // New connection epoch (D7.1): every counter/episode resets and a fresh
     // nonce is minted, so ledger evidence can never span two calls.
     this.resetLedger();
@@ -1080,7 +1043,7 @@ export class VoiceTransport {
     if (this.audioCtx) this.audioCtx.onstatechange = null;
     this.stopMic();
     this.stopStats();
-    this.flushPlayback(true);
+    this.flushPlayback();
     if (this.audioCtx && this.audioCtx.state !== 'closed') {
       try {
         this.audioCtx.close();
@@ -1090,7 +1053,6 @@ export class VoiceTransport {
     }
     this.audioCtx = null;
     this.analyserNode = null; // recreated against the next ctx in playChunk
-    this.playbackEnvelope = null;
   }
 
   // ─── attempt outcome handling (Step 18) ─────────────────────
@@ -1662,15 +1624,6 @@ export class VoiceTransport {
     if (f32.length === 0) return;
 
     try {
-      const now = ctx.currentTime;
-      const contiguous = this.nextPlayTime >= now && this.lastPlaybackSample !== null;
-      if (!contiguous) this.nextPlayTime = now + PLAYBACK_REANCHOR_S;
-      smoothPcmSeam(
-        f32,
-        contiguous ? this.lastPlaybackSample : null,
-        contiguous ? this.lastPlaybackSlope : 0,
-        this.outputRate,
-      );
       const audioBuf = ctx.createBuffer(1, f32.length, this.outputRate);
       audioBuf.getChannelData(0).set(f32);
 
@@ -1681,33 +1634,17 @@ export class VoiceTransport {
       if (!this.analyserNode) {
         this.analyserNode = ctx.createAnalyser();
         this.analyserNode.fftSize = 256;
-        // Trim and compress before the device. Source samples can reach full
-        // scale, leaving no headroom for downstream per-stream effects.
-        const trim = ctx.createGain();
-        trim.gain.value = PLAYBACK_GAIN;
-        this.playbackEnvelope = ctx.createGain();
-        this.playbackEnvelope.gain.value = 0;
-        const limiter = ctx.createDynamicsCompressor();
-        limiter.threshold.value = -1.5;
-        limiter.knee.value = 0;
-        limiter.ratio.value = 20;
-        limiter.attack.value = 0.003;
-        limiter.release.value = 0.1;
-        this.analyserNode.connect(trim);
-        trim.connect(this.playbackEnvelope);
-        this.playbackEnvelope.connect(limiter);
-        limiter.connect(ctx.destination);
+        this.analyserNode.connect(ctx.destination);
         this.ev.onAnalyser?.(this.analyserNode);
       }
       src.connect(this.analyserNode);
 
-      const startTime = this.nextPlayTime;
-      const endTime = startTime + audioBuf.duration / this.playbackRate;
-      this.schedulePlaybackEnvelope(ctx, startTime, endTime, contiguous);
-      src.start(startTime);
-      this.nextPlayTime = endTime;
-      this.lastPlaybackSample = f32[f32.length - 1];
-      this.lastPlaybackSlope = f32.length > 1 ? f32[f32.length - 1] - f32[f32.length - 2] : 0;
+      const now = ctx.currentTime;
+      if (this.nextPlayTime < now) {
+        this.nextPlayTime = now + 0.05;
+      }
+      src.start(this.nextPlayTime);
+      this.nextPlayTime += audioBuf.duration / this.playbackRate;
       const entry = { src, cancelled: false };
       this.activeSources.push(entry);
       src.onended = () => {
@@ -1735,53 +1672,8 @@ export class VoiceTransport {
     }
   }
 
-  /** A queue tail can end at a nonzero sample. Fade only at the current tail;
-   * a following packet cancels that pending fade before it starts. */
-  private schedulePlaybackEnvelope(ctx: AudioContext, start: number, end: number, contiguous: boolean): void {
-    const param = this.playbackEnvelope?.gain;
-    if (!param) return;
-    const fade = Math.min(PLAYBACK_EDGE_FADE_S, (end - start) / 2);
-    if (!contiguous) {
-      param.cancelScheduledValues(start);
-      param.setValueAtTime(0, start);
-      param.linearRampToValueAtTime(1, start + fade);
-    } else if (this.playbackReleaseStart > 0) {
-      if (ctx.currentTime < this.playbackReleaseStart) {
-        param.cancelScheduledValues(this.playbackReleaseStart);
-        param.setValueAtTime(1, this.playbackReleaseStart);
-      } else {
-        // The next packet arrived during the old tail's release. Keep its
-        // current level before recovering instead of jumping to full gain.
-        if (typeof param.cancelAndHoldAtTime === 'function') {
-          param.cancelAndHoldAtTime(ctx.currentTime);
-        } else {
-          const remaining = Math.max(0, this.playbackReleaseEnd - ctx.currentTime);
-          const duration = this.playbackReleaseEnd - this.playbackReleaseStart;
-          param.cancelScheduledValues(ctx.currentTime);
-          param.setValueAtTime(duration > 0 ? remaining / duration : 0, ctx.currentTime);
-        }
-        param.linearRampToValueAtTime(1, ctx.currentTime + fade);
-      }
-    }
-    this.playbackReleaseStart = Math.max(start + fade, end - fade);
-    this.playbackReleaseEnd = end;
-    param.setValueAtTime(1, this.playbackReleaseStart);
-    param.linearRampToValueAtTime(0, end);
-  }
-
   /** Stop and drop all scheduled playback (barge-in / disconnect). */
-  private flushPlayback(immediate = false): void {
-    const ctx = this.audioCtx;
-    if (!immediate && ctx && this.playbackEnvelope && this.activeSources.length > 0) {
-      const param = this.playbackEnvelope.gain;
-      if (typeof param.cancelAndHoldAtTime === 'function') {
-        param.cancelAndHoldAtTime(ctx.currentTime);
-      } else {
-        param.cancelScheduledValues(ctx.currentTime);
-        param.setValueAtTime(param.value, ctx.currentTime);
-      }
-      param.linearRampToValueAtTime(0, ctx.currentTime + PLAYBACK_EDGE_FADE_S);
-    }
+  private flushPlayback(): void {
     for (const entry of this.activeSources) {
       // Counted HERE, deterministically — not in onended (which a closed ctx
       // may never fire). The flag keeps a trailing onended from also counting
@@ -1789,17 +1681,13 @@ export class VoiceTransport {
       entry.cancelled = true;
       this.chunksCancelled++;
       try {
-        entry.src.stop(immediate || !ctx ? undefined : ctx.currentTime + PLAYBACK_EDGE_FADE_S);
+        entry.src.stop();
       } catch {
         /* already stopped */
       }
     }
     this.activeSources = [];
     this.nextPlayTime = 0;
-    this.lastPlaybackSample = null;
-    this.lastPlaybackSlope = 0;
-    this.playbackReleaseStart = 0;
-    this.playbackReleaseEnd = 0;
   }
 
   // ─── helpers ────────────────────────────────────────────────

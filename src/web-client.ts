@@ -24,6 +24,9 @@ const HTTP_PORT = Number(process.env.CLIENT_PORT) || 8080;
 const HTTP_HOST = process.env.CLIENT_HOST || '0.0.0.0'; // '0.0.0.0' binds to all interfaces for EC2
 const WS_PORT = Number(process.env.PORT) || 9900;
 const DEFAULT_WS_URL = `ws://localhost:${WS_PORT}`;
+// Tool audio cue stream. Off by default so already-open pages stay quiet; set
+// SUTANDO_TOOL_CUES=1 only for a diagnostic session that wants tones.
+const TOOL_CUES_ENABLED = /^(1|true|yes|on)$/i.test(process.env.SUTANDO_TOOL_CUES || '');
 // Opt-in LAN sharing. The voice WS (WS_PORT) binds loopback only, so a browser
 // on another device on the same network can't reach it. When enabled, this
 // server proxies WS_PORT through its own LAN-reachable HTTP port at /ws — so a
@@ -1024,9 +1027,8 @@ function initRemoteToggle() {
       });
     } catch {}
   });
-  // Short audible cue when the agent invokes a tool/core (owner ask
-  // 2026-07-09) — a subtle "the answer is grounded" signal. Distinct pitch
-  // per kind: research (cloud lookup) / work (local core) / tool (inline).
+  // Tool/core activity cue. Browsers receive this as a silent visual signal by
+  // default; optional audio is guarded in playToolCue().
   _sseSource.addEventListener('tool-cue', function(e) {
     try { playToolCue(String(e.data || '').trim()); } catch {}
   });
@@ -1041,12 +1043,20 @@ document.addEventListener('visibilitychange', () => {
 // Page-level AudioContext is for tool cues ONLY — the voice audio graph
 // (mic capture + playback) lives inside the canonical transport.
 let audioCtx = null;
-// Play a short, low-volume Web Audio blip to signal a tool/core invocation
-// (owner ask 2026-07-09). Reuses the AudioContext created on the call's user
-// gesture, so it's already running during a voice session. Pitch/shape differ
-// by kind so the user can tell a cloud research lookup from a local-core
-// handoff by ear alone. Fire-and-forget: never blocks or gates the tool call.
+function toolCueSoundsEnabled() {
+  try {
+    var params = new URLSearchParams(window.location.search || '');
+    var value = params.get('toolCues') || params.get('tool_cues');
+    if (value) return /^(1|true|on|sound|audio)$/i.test(value);
+  } catch (e) {}
+  try { return localStorage.getItem('sutando.toolCueAudio') === '1'; } catch (e) {}
+  return false;
+}
+
+// Tool cues are broadcast to every page; keep them visual-only unless enabled.
 function playToolCue(kind) {
+  if (!toolCueSoundsEnabled()) return;
+  if (!connected || !voice || !voice.connected) return;
   try {
     if (!audioCtx) { try { audioCtx = new AudioContext(); } catch (e) { return; } }
     if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
@@ -4350,15 +4360,12 @@ const server = createServer((req, res) => {
 					_preSeeingToolState = 'idle';
 					if (aState === 'working' && labelParam) _toolLabel = labelParam;
 					else if (aState !== 'working') _toolLabel = '';
-					// Sound cue (owner ask 2026-07-09): emit a short audible blip per
-					// tool/core invocation so the user hears the answer is grounded.
-					// Distinct pitch for cloud research vs local core (work) vs inline
-					// tool. Fires on the leading edge — this branch = one onToolCall's
-					// working post → one cue. A SEPARATE SSE event from agent-state so it
+					// Tool cue: a separate SSE event from agent-state so it
 					// still fires when effectiveAgentState() is unchanged (back-to-back
 					// tool calls stay 'working', which suppresses the agent-state
 					// broadcast at the prevEffective===nextEffective guard below).
-					if (aState === 'working' && labelParam) {
+					// Browser audio is opt-in; default clients keep this visual-only.
+					if (TOOL_CUES_ENABLED && aState === 'working' && labelParam) {
 						const l = labelParam.toLowerCase();
 						const cueKind = (l === 'work' || l === 'ask_sutando' || l === 'ask_core')
 							? 'work'

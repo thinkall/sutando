@@ -43,6 +43,29 @@ async function fetchJson(path: string): Promise<any> {
 	return res.json();
 }
 
+async function readSseFor(ms: number): Promise<string> {
+	const controller = new AbortController();
+	const res = await fetch(`http://localhost:${PORT}/sse`, { signal: controller.signal });
+	assert.ok(res.body, 'SSE response must have a body');
+	const reader = res.body.getReader();
+	const chunks: string[] = [];
+	const deadline = Date.now() + ms;
+	try {
+		while (Date.now() < deadline) {
+			const next = await Promise.race([
+				reader.read(),
+				delay(deadline - Date.now()).then(() => null),
+			]);
+			if (!next || next.done) break;
+			chunks.push(new TextDecoder().decode(next.value));
+		}
+	} finally {
+		controller.abort();
+		try { await reader.cancel(); } catch { /* already closed */ }
+	}
+	return chunks.join('');
+}
+
 describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 	before(async () => {
 		// Write idle core-status into the per-test-process workspace temp dir.
@@ -57,8 +80,8 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		try { unlinkSync(VOICE_STATE_PATH); } catch { /* already gone */ }
 
 		child = spawn(
-			'npx',
-			['tsx', 'src/web-client.ts'],
+			process.execPath,
+			['--import', 'tsx', 'src/web-client.ts'],
 			{
 				env: {
 					...process.env,
@@ -168,6 +191,14 @@ describe('/sse-status + /mute-state — agent state plumbing (PR #418)', () => {
 		await fetchJson('/mute-state?state=idle&source=tool');
 		const body2 = await fetchJson('/sse-status');
 		assert.equal(body2.state, 'listening', 'clearing tool track reveals browser track');
+	});
+
+	it('does not broadcast tool-cue events by default', async () => {
+		const sse = readSseFor(300);
+		await delay(50);
+		await fetchJson('/mute-state?state=working&source=tool&label=search');
+		const stream = await sse;
+		assert.ok(!stream.includes('event: tool-cue'), 'default server stream must stay silent for old tabs');
 	});
 
 	it('rejects invalid agent state (keeps previous value)', async () => {

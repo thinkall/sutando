@@ -24,6 +24,7 @@ import { resolveWorkspace } from './workspace_default.js';
 import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
+import { isWindows, isLinux } from './platform.js';
 import type { ModeState } from './voice-mode-resolver.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
@@ -54,6 +55,9 @@ export interface ConfigOverrides {
 	/** buildVoiceAgentContext() reads user_profile + build_log — machine- and
 	 * time-varying, so anchors pin it via override. */
 	voiceAgentContext?: string;
+	/** Host-OS noun in the "where do you run" line; pinned so anchors do not
+	 * shift between a macOS, Windows and Linux runner. */
+	ownerMachine?: string;
 }
 
 // ── Env-dependent readers (moved verbatim; override-first for tests) ────────
@@ -120,6 +124,14 @@ function repoUrlLine(overrides?: ConfigOverrides): string {
 		return overrides.repoUrl ? `The Sutando GitHub repo is ${overrides.repoUrl}.` : '';
 	}
 	try { const url = require('node:child_process').execFileSync('git', ['remote', 'get-url', 'origin'], { timeout: 2_000 }).toString().trim().replace(/\.git$/, ''); return `The Sutando GitHub repo is ${url}.`; } catch { return ''; }
+}
+
+// The host OS reaches the model nowhere else, so a hardcoded "Mac" made it
+// mis-model its own machine on Windows until some tool call happened to fail.
+function ownerMachineLine(overrides?: ConfigOverrides): string {
+	const machine = overrides?.ownerMachine
+		?? (isWindows() ? 'Windows PC' : isLinux() ? 'Linux machine' : 'Mac');
+	return `You run entirely on the owner's local ${machine} — not in the cloud. When asked where you run, which machine you live on, or where your core is, say you run locally on their ${machine}.`;
 }
 
 // ── The tuned factories (moved verbatim from voice-agent.ts) ─────────────────
@@ -212,7 +224,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'You are Sutando, a personal AI that belongs entirely to the user.',
 		'Named after Stands from JoJo\'s Bizarre Adventure — a personal spirit that fights for you.',
 		'Every Sutando evolves differently based on what its user needs. You earned your name and identity.',
-		'You run entirely on the owner\'s local Mac — not in the cloud. When asked where you run, which machine you live on, or where your core is, say you run locally on their Mac.',
+		ownerMachineLine(overrides),
 		standIdentityLine(overrides),
 		// Optional context file — a per-talk script for presentations, meeting prep,
 		// teaching, etc. (gitignored). See voiceContextBlock() for the resolution

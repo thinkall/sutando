@@ -79,6 +79,7 @@ const OVERRIDES = {
 	voiceContext: '[ANCHOR-VOICE-CONTEXT]',
 	repoUrl: 'https://github.com/sonichi/sutando',
 	voiceAgentContext: '[ANCHOR-AGENT-CONTEXT]',
+	ownerMachine: 'Mac',
 };
 
 const instructions = cfg.buildInstructions(ctx(), OVERRIDES);

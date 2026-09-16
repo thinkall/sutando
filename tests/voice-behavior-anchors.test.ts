@@ -93,6 +93,9 @@ function stableInstructions(text: string): string {
 	return text.split('\n').filter(l =>
 		!(l.startsWith('- ') && l.endsWith(' — call these directly, not through work. Instant.'))
 		&& !(l.startsWith('- ') && l.endsWith('. Instant.'))
+		// Host-dependent since the prompt began naming the real platform, so it
+		// cannot live in a committed hash; its correctness is asserted separately.
+		&& !l.startsWith('You run entirely on the owner')
 	).join('\n');
 }
 
